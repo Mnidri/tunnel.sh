@@ -28,19 +28,16 @@ install_prerequisites() {
     apt update -y >/dev/null 2>&1
     apt install -y curl wget iptables iproute2 net-tools iputils-ping dnsutils tar >/dev/null 2>&1
 
-    # Kernel IP Forwarding
     sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1
     sed -i '/net.ipv4.ip_forward/d' /etc/sysctl.conf
     echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
 
-    # Install GOST binary if missing
     if [ ! -f /usr/local/bin/gost ]; then
         echo -e "${YELLOW}[*] Installing GOST binary...${NC}"
         ARCH=$(uname -m)
         case "$ARCH" in
             x86_64) GOST_ARCH="amd64" ;;
             aarch64) GOST_ARCH="arm64" ;;
-            armv7l) GOST_ARCH="armv7" ;;
             *) echo -e "${RED}[!] Unsupported architecture: $ARCH${NC}"; exit 1 ;;
         esac
         
@@ -73,7 +70,6 @@ create_gost_tunnel() {
     read -p "Select option [1-2, default: 1]: " SERVER_ROLE
     SERVER_ROLE=${SERVER_ROLE:-1}
 
-    # Set paired defaults according to role
     if [ "$SERVER_ROLE" == "1" ]; then
         ROLE_NAME="SERVER"
         DEF_NAME="tun1"
@@ -113,20 +109,16 @@ create_gost_tunnel() {
     read -p "Remote Tunnel IP [default: ${DEF_REMOTE_IP}]: " REMOTE_TUN_IP
     REMOTE_TUN_IP=${REMOTE_TUN_IP:-$DEF_REMOTE_IP}
 
-    read -p "MTU [default: 1360]: " MTU
-    MTU=${MTU:-1360}
-
-    # Format execution command without shell syntax bugs
     if [ "$ROLE_NAME" == "SERVER" ]; then
-        EXEC_CMD="/usr/local/bin/gost -L tun://:${PORT}?net=${LOCAL_TUN_IP}&name=${TUN_NAME}&mtu=${MTU}"
+        EXEC_CMD="/usr/local/bin/gost -L \"tun://:${PORT}?net=${LOCAL_TUN_IP}\""
         iptables -I INPUT -p tcp --dport ${PORT} -j ACCEPT 2>/dev/null
     else
-        EXEC_CMD="/usr/local/bin/gost -L tun://:0?net=${LOCAL_TUN_IP}&name=${TUN_NAME}&mtu=${MTU} -F tcp://${REMOTE_PUB_IP}:${PORT}"
+        EXEC_CMD="/usr/local/bin/gost -L \"tun://:0?net=${LOCAL_TUN_IP}\" -F \"tcp://${REMOTE_PUB_IP}:${PORT}\""
     fi
 
-    iptables -I INPUT -i ${TUN_NAME} -j ACCEPT 2>/dev/null
-    iptables -I FORWARD -i ${TUN_NAME} -j ACCEPT 2>/dev/null
-    iptables -I FORWARD -o ${TUN_NAME} -j ACCEPT 2>/dev/null
+    iptables -I INPUT -i tun+ -j ACCEPT 2>/dev/null
+    iptables -I FORWARD -i tun+ -j ACCEPT 2>/dev/null
+    iptables -I FORWARD -o tun+ -j ACCEPT 2>/dev/null
 
     cat << EOF > /etc/systemd/system/tunnel-${TUN_NAME}.service
 [Unit]
@@ -135,7 +127,7 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=${EXEC_CMD}
+ExecStart=/bin/bash -c '${EXEC_CMD}'
 Restart=always
 RestartSec=3
 LimitNOFILE=65535
@@ -152,7 +144,6 @@ PORT="${PORT}"
 LOCAL_TUN_IP="${LOCAL_TUN_IP}"
 REMOTE_TUN_IP="${REMOTE_TUN_IP}"
 REMOTE_PUB_IP="${REMOTE_PUB_IP:-N/A}"
-MTU="${MTU}"
 EOF
 
     systemctl daemon-reload
@@ -220,13 +211,15 @@ After=network.target
 
 [Service]
 Type=oneshot
+ExecStartPre=-/sbin/ip link set ${TUN_NAME} down
+ExecStartPre=-/sbin/ip tunnel del ${TUN_NAME}
 ExecStartPre=/sbin/modprobe ip_gre
 ExecStart=/sbin/ip tunnel add ${TUN_NAME} mode gre remote ${REMOTE_PUB_IP} local ${LOCAL_PUB_IP} ttl 255
 ExecStart=/sbin/ip addr add ${LOCAL_TUN_IP} dev ${TUN_NAME}
 ExecStart=/sbin/ip link set dev ${TUN_NAME} mtu ${MTU}
 ExecStart=/sbin/ip link set ${TUN_NAME} up
-ExecStop=/sbin/ip link set ${TUN_NAME} down
-ExecStop=/sbin/ip tunnel del ${TUN_NAME}
+ExecStop=-/sbin/ip link set ${TUN_NAME} down
+ExecStop=-/sbin/ip tunnel del ${TUN_NAME}
 RemainAfterExit=yes
 
 [Install]
@@ -271,7 +264,7 @@ show_summary() {
     echo -e "Remote Tunnel IP  : ${YELLOW}${REMOTE_TUN_IP}${NC}"
     [ "$TYPE" == "GOST" ] && echo -e "TCP Listen Port   : ${YELLOW}${PORT}${NC}"
     [ "$TYPE" == "GOST" ] && [ "$ROLE" == "CLIENT" ] && echo -e "Target Public IP  : ${YELLOW}${REMOTE_PUB_IP}${NC}"
-    echo -e "MTU Size          : ${YELLOW}${MTU}${NC}"
+    [ "$TYPE" == "GRE" ] && echo -e "MTU Size          : ${YELLOW}${MTU}${NC}"
     echo -e "Systemd Service   : ${CYAN}tunnel-${TUN_NAME}.service${NC}"
     if [ "$IS_ACTIVE" == "active" ]; then
         echo -e "Current Status    : ${GREEN}Active & Running (UP)${NC}"
@@ -310,7 +303,7 @@ list_tunnels() {
     read -p "Press Enter to return..."
 }
 
-# ----------------- Ping Connectivity Test (Numbered Menu) -----------------
+# ----------------- Ping Connectivity Test -----------------
 test_ping() {
     clear
     echo -e "${CYAN}=== Tunnel Connectivity Test (Ping) ===${NC}\n"
@@ -337,7 +330,7 @@ test_ping() {
     read -p "Press Enter to return..."
 }
 
-# ----------------- Delete Tunnel (Numbered Menu) -----------------
+# ----------------- Delete Tunnel -----------------
 delete_tunnel() {
     clear
     echo -e "${RED}=== Delete Tunnel ===${NC}\n"
@@ -369,7 +362,7 @@ delete_tunnel() {
                 ip link set dev "${TUN_NAME}" down 2>/dev/null
                 ip tunnel del "${TUN_NAME}" 2>/dev/null
             elif [ "$TYPE" == "GOST" ]; then
-                ip link set dev "${TUN_NAME}" down 2>/dev/null
+                killall -9 gost 2>/dev/null
             fi
 
             rm -f "$CONF_FILE"
