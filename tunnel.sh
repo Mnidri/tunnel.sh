@@ -1,6 +1,6 @@
 #!/bin/bash
 # ====================================================
-# Multi-Tunnel Manager (GOST & GRE) - Fully Fixed
+# Multi-Tunnel Manager (GOST & GRE) - Fully Fixed Ping
 # GitHub: https://github.com/Mnidri/tunnel.sh
 # ====================================================
 
@@ -23,7 +23,7 @@ get_public_ip() {
     echo "${IP}"
 }
 
-# ----------------- Prerequisites (Fixed ARM Download) -----------------
+# ----------------- Prerequisites -----------------
 install_prerequisites() {
     clear
     echo -e "${CYAN}[*] Verifying system dependencies...${NC}"
@@ -39,9 +39,9 @@ install_prerequisites() {
         ARCH=$(uname -m)
         case "$ARCH" in
             x86_64) GOST_ARCH="amd64" ;;
-            aarch64|arm64) GOST_ARCH="armv8" ;; # GOST uses armv8 for aarch64
+            aarch64|arm64) GOST_ARCH="armv8" ;; 
             armv7l|armv7) GOST_ARCH="armv7" ;;
-            *) GOST_ARCH="amd64" ;; # Fallback
+            *) GOST_ARCH="amd64" ;; 
         esac
         
         GOST_URL="https://github.com/ginuerzh/gost/releases/download/v2.11.5/gost-linux-${GOST_ARCH}-2.11.5.gz"
@@ -50,13 +50,10 @@ install_prerequisites() {
         
         rm -f /tmp/gost*
         
-        # 1. Try Direct GitHub
         echo -e "${CYAN} -> Fetching GOST (${GOST_ARCH}) from GitHub...${NC}"
         if ! curl -sSL -f -o /tmp/gost.gz "${GOST_URL}"; then
-            # 2. Try Mirror 1
             echo -e "${YELLOW} -> GitHub blocked/failed. Trying Mirror 1...${NC}"
             if ! curl -sSL -f -o /tmp/gost.gz "${MIRROR1}"; then
-                # 3. Try Mirror 2
                 echo -e "${YELLOW} -> Mirror 1 failed. Trying Mirror 2...${NC}"
                 curl -sSL -f -o /tmp/gost.gz "${MIRROR2}"
             fi
@@ -88,7 +85,7 @@ get_config_files() {
     done
 }
 
-# ----------------- Create GOST Tunnel -----------------
+# ----------------- Create GOST Tunnel (FIXED TCP RELAY) -----------------
 create_gost_tunnel() {
     clear
     echo -e "${CYAN}=== Create GOST Tunnel (TCP Layer 3 TUN) ===${NC}\n"
@@ -138,11 +135,14 @@ create_gost_tunnel() {
     read -p "Remote Tunnel IP [default: ${DEF_REMOTE_IP}]: " REMOTE_TUN_IP
     REMOTE_TUN_IP=${REMOTE_TUN_IP:-$DEF_REMOTE_IP}
 
+    # حل مشکل پینگ: استفاده از لایه relay+tcp برای تبدیل دیتای TUN به TCP سالم
     if [ "$ROLE_NAME" == "SERVER" ]; then
-        EXEC_CMD="/usr/local/bin/gost -L tun://:${PORT}?net=${LOCAL_TUN_IP}"
+        # سرور خارج یک پراکسی TCP می‌سازد و پشت آن اینترفیس TUN را فعال می‌کند (پورت داخلی 8421)
+        EXEC_CMD="/usr/local/bin/gost -L relay+tcp://:${PORT} -L tun://:8421?net=${LOCAL_TUN_IP}"
         iptables -I INPUT -p tcp --dport ${PORT} -j ACCEPT 2>/dev/null
     else
-        EXEC_CMD="/usr/local/bin/gost -L tun://:10443?net=${LOCAL_TUN_IP} -F tcp://${REMOTE_PUB_IP}:${PORT}"
+        # سرور ایران دیتا را وارد TUN می‌کند و از طریق پراکسی TCP به سرور خارج می‌فرستد
+        EXEC_CMD="/usr/local/bin/gost -L tun://:8421?net=${LOCAL_TUN_IP} -F relay+tcp://${REMOTE_PUB_IP}:${PORT}"
     fi
 
     iptables -I INPUT -i tun+ -j ACCEPT 2>/dev/null
@@ -183,7 +183,7 @@ EOF
     show_summary "${TUN_NAME}"
 }
 
-# ----------------- Create GRE Tunnel -----------------
+# ----------------- Create GRE Tunnel (DO NOT TOUCH) -----------------
 create_gre_tunnel() {
     clear
     echo -e "${CYAN}=== Create GRE Tunnel ===${NC}\n"
