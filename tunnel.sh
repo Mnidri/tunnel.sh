@@ -16,7 +16,6 @@ mkdir -p "${CONFIG_DIR}"
 
 # ----------------- Helper: Detect Public IP -----------------
 get_public_ip() {
-    # دریافت آی‌پی و فیلتر کردن هرگونه کد HTML
     local IP=$(curl -s4 --max-time 3 api.ipify.org | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$')
     if [ -z "$IP" ]; then
         IP=$(curl -s4 --max-time 3 icanhazip.com | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$')
@@ -24,20 +23,19 @@ get_public_ip() {
     echo "${IP}"
 }
 
-# ----------------- Prerequisites (Anti-Filter Download) -----------------
+# ----------------- Prerequisites (Fixed Download Logic) -----------------
 install_prerequisites() {
     clear
     echo -e "${CYAN}[*] Verifying system dependencies...${NC}"
     apt update -y >/dev/null 2>&1
-    apt install -y curl wget iptables iproute2 net-tools iputils-ping dnsutils tar >/dev/null 2>&1
+    apt install -y curl wget iptables iproute2 net-tools iputils-ping dnsutils gzip >/dev/null 2>&1
 
     sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1
     sed -i '/net.ipv4.ip_forward/d' /etc/sysctl.conf
     echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
 
-    # دانلود هوشمندانه GOST با استفاده از لینک‌های Mirror برای سرور ایران
     if [ ! -f /usr/local/bin/gost ]; then
-        echo -e "${YELLOW}[*] Installing GOST binary... (Checking connections)${NC}"
+        echo -e "${YELLOW}[*] Downloading GOST binary...${NC}"
         ARCH=$(uname -m)
         case "$ARCH" in
             x86_64) GOST_ARCH="amd64" ;;
@@ -45,21 +43,30 @@ install_prerequisites() {
             *) echo -e "${RED}[!] Unsupported architecture: $ARCH${NC}"; exit 1 ;;
         esac
         
-        GOST_URL="https://github.com/ginuerzh/gost/releases/download/v2.11.5/gost-linux-${GOST_ARCH}-2.11.5.tar.gz"
+        # فرمت فایل‌های GOST در گیت‌هاب .gz است
+        GOST_URL="https://github.com/ginuerzh/gost/releases/download/v2.11.5/gost-linux-${GOST_ARCH}-2.11.5.gz"
         MIRROR_URL="https://mirror.ghproxy.com/${GOST_URL}"
         
-        # تلاش برای دانلود مستقیم، در صورت شکست (ایران) استفاده از میرور
-        wget -q --timeout=5 -O /tmp/gost.tar.gz "${GOST_URL}" || wget -q --timeout=10 -O /tmp/gost.tar.gz "${MIRROR_URL}"
+        rm -f /tmp/gost*
         
-        if [ -s /tmp/gost.tar.gz ]; then
-            tar -xzf /tmp/gost.tar.gz -C /tmp/
-            find /tmp -type f -name "gost-linux-*" -exec mv {} /usr/local/bin/gost \;
-            chmod +x /usr/local/bin/gost
-            rm -rf /tmp/gost*
-            echo -e "${GREEN}[+] GOST installed successfully.${NC}"
+        # تلاش برای دانلود مستقیم
+        if ! wget -q --show-progress --timeout=10 -O /tmp/gost.gz "${GOST_URL}"; then
+            echo -e "${YELLOW}[*] Direct download failed. Trying Anti-Filter Mirror...${NC}"
+            wget -q --show-progress --timeout=15 -O /tmp/gost.gz "${MIRROR_URL}"
+        fi
+        
+        if [ -s /tmp/gost.gz ]; then
+            gzip -df /tmp/gost.gz
+            if [ -f /tmp/gost ]; then
+                mv /tmp/gost /usr/local/bin/gost
+                chmod +x /usr/local/bin/gost
+                echo -e "${GREEN}[+] GOST installed successfully.${NC}"
+            else
+                echo -e "${RED}[!] Extraction failed. Downloaded file might be corrupted.${NC}"
+                rm -f /tmp/gost*
+            fi
         else
-            echo -e "${RED}[!] Failed to download GOST. Internet/DNS issue on this server.${NC}"
-            read -p "Press Enter to continue anyway..."
+            echo -e "${RED}[!] Failed to download GOST. Check server internet access.${NC}"
         fi
     fi
     echo -e "${GREEN}[+] Dependencies are ready.${NC}\n"
@@ -169,7 +176,7 @@ EOF
     show_summary "${TUN_NAME}"
 }
 
-# ----------------- Create GRE Tunnel (DO NOT TOUCH - WORKING PERFECTLY) -----------------
+# ----------------- Create GRE Tunnel -----------------
 create_gre_tunnel() {
     clear
     echo -e "${CYAN}=== Create GRE Tunnel ===${NC}\n"
