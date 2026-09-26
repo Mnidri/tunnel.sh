@@ -1,6 +1,6 @@
 #!/bin/bash
 # ====================================================
-# Multi-Tunnel Manager (GOST WSS PF & GRE) - V3
+# Multi-Tunnel Manager (GOST MWS PF & GRE) - V4
 # GitHub: https://github.com/Mnidri/tunnel.sh
 # ====================================================
 
@@ -14,7 +14,6 @@ BASE_DIR="/etc/tunnel-core"
 CONFIG_DIR="${BASE_DIR}/configs"
 mkdir -p "${CONFIG_DIR}"
 
-# ----------------- Helper: Detect Public IP -----------------
 get_public_ip() {
     local IP=$(curl -s4 --max-time 3 api.ipify.org | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$')
     if [ -z "$IP" ]; then
@@ -23,7 +22,6 @@ get_public_ip() {
     echo "${IP}"
 }
 
-# ----------------- Prerequisites -----------------
 install_prerequisites() {
     clear
     echo -e "${CYAN}[*] Verifying system dependencies...${NC}"
@@ -82,11 +80,11 @@ get_config_files() {
     done
 }
 
-# ----------------- 1. Create GOST Port Forward (L4 WSS) -----------------
+# ----------------- 1. Create GOST Port Forward (L4 MWS) -----------------
 create_gost_pf() {
     clear
-    echo -e "${CYAN}=== Create GOST Port Forward (Secure WebSocket - WSS) ===${NC}"
-    echo -e "${YELLOW}Fully independent secure tunnel for port forwarding.${NC}\n"
+    echo -e "${CYAN}=== Create GOST Port Forward (Multiplex WebSocket - MWS) ===${NC}"
+    echo -e "${YELLOW}Bypasses DPI TLS-Handshake blocks perfectly.${NC}\n"
     
     echo -e "${YELLOW}Select Server Role:${NC}"
     echo "1) Foreign Server (Server / Listener)"
@@ -112,15 +110,15 @@ create_gost_pf() {
     AUTH_PASS=${AUTH_PASS:-Pass123!}
 
     echo -e "\n${YELLOW}--- Port Configuration ---${NC}"
-    read -p "Secure WSS Tunnel Port (between servers) [default: 443]: " TUN_PORT
-    TUN_PORT=${TUN_PORT:-443}
+    read -p "MWS Tunnel Port (between servers) [default: 8080]: " TUN_PORT
+    TUN_PORT=${TUN_PORT:-8080}
 
     APP_PORT="N/A"
     TARGET_IP="N/A"
     REMOTE_PUB_IP="N/A"
 
     if [ "$ROLE_NAME" == "SERVER" ]; then
-        EXEC_CMD="/usr/local/bin/gost -L relay+wss://${AUTH_USER}:${AUTH_PASS}@:${TUN_PORT}"
+        EXEC_CMD="/usr/local/bin/gost -L relay+mws://${AUTH_USER}:${AUTH_PASS}@:${TUN_PORT}"
         iptables -I INPUT -p tcp --dport ${TUN_PORT} -j ACCEPT 2>/dev/null
     else
         while true; do
@@ -133,8 +131,8 @@ create_gost_pf() {
         read -p "Target IP on Foreign Server [default: 127.0.0.1]: " TARGET_IP
         TARGET_IP=${TARGET_IP:-127.0.0.1}
         
-        # Listen locally, forward via WSS to target IP/Port on foreign server
-        EXEC_CMD="/usr/local/bin/gost -L tcp://:${APP_PORT}/${TARGET_IP}:${APP_PORT} -L udp://:${APP_PORT}/${TARGET_IP}:${APP_PORT} -F relay+wss://${AUTH_USER}:${AUTH_PASS}@${REMOTE_PUB_IP}:${TUN_PORT}"
+        # Changed relay+wss to relay+mws
+        EXEC_CMD="/usr/local/bin/gost -L tcp://:${APP_PORT}/${TARGET_IP}:${APP_PORT} -L udp://:${APP_PORT}/${TARGET_IP}:${APP_PORT} -F relay+mws://${AUTH_USER}:${AUTH_PASS}@${REMOTE_PUB_IP}:${TUN_PORT}"
         iptables -I INPUT -p tcp --dport ${APP_PORT} -j ACCEPT 2>/dev/null
         iptables -I INPUT -p udp --dport ${APP_PORT} -j ACCEPT 2>/dev/null
     fi
@@ -186,7 +184,7 @@ start_service() {
     sleep 2
 }
 
-# ----------------- 2. Create GRE Tunnel (UNTOUCHED) -----------------
+# ----------------- 2. Create GRE Tunnel -----------------
 create_gre_tunnel() {
     clear
     echo -e "${CYAN}=== Create GRE Tunnel (Raw L3) ===${NC}\n"
@@ -352,7 +350,6 @@ test_ping() {
     read -p "Press Enter to return..."
 }
 
-# ----------------- EDIT TUNNEL -----------------
 edit_tunnel() {
     clear
     echo -e "${CYAN}=== Edit Existing Tunnel ===${NC}\n"
@@ -381,7 +378,7 @@ edit_tunnel() {
             AUTH_USER=${NEW_AUTH_USER:-$AUTH_USER}
             read -p "Password [${AUTH_PASS}]: " NEW_AUTH_PASS
             AUTH_PASS=${NEW_AUTH_PASS:-$AUTH_PASS}
-            read -p "Secure WSS Tunnel Port [${TUN_PORT}]: " NEW_TUN_PORT
+            read -p "MWS Tunnel Port [${TUN_PORT}]: " NEW_TUN_PORT
             TUN_PORT=${NEW_TUN_PORT:-$TUN_PORT}
 
             if [ "$ROLE" == "CLIENT" ]; then
@@ -392,9 +389,9 @@ edit_tunnel() {
                 read -p "Target IP on Foreign Server [${TARGET_IP}]: " NEW_TARGET_IP
                 TARGET_IP=${NEW_TARGET_IP:-$TARGET_IP}
                 
-                EXEC_CMD="/usr/local/bin/gost -L tcp://:${APP_PORT}/${TARGET_IP}:${APP_PORT} -L udp://:${APP_PORT}/${TARGET_IP}:${APP_PORT} -F relay+wss://${AUTH_USER}:${AUTH_PASS}@${REMOTE_PUB_IP}:${TUN_PORT}"
+                EXEC_CMD="/usr/local/bin/gost -L tcp://:${APP_PORT}/${TARGET_IP}:${APP_PORT} -L udp://:${APP_PORT}/${TARGET_IP}:${APP_PORT} -F relay+mws://${AUTH_USER}:${AUTH_PASS}@${REMOTE_PUB_IP}:${TUN_PORT}"
             else
-                EXEC_CMD="/usr/local/bin/gost -L relay+wss://${AUTH_USER}:${AUTH_PASS}@:${TUN_PORT}"
+                EXEC_CMD="/usr/local/bin/gost -L relay+mws://${AUTH_USER}:${AUTH_PASS}@:${TUN_PORT}"
             fi
             
             generate_gost_service
@@ -489,9 +486,9 @@ install_prerequisites
 while true; do
     clear
     echo -e "${CYAN}====================================================${NC}"
-    echo -e "${CYAN}         Tunnel Manager (GOST WSS & GRE)            ${NC}"
+    echo -e "${CYAN}         Tunnel Manager (GOST MWS & GRE)            ${NC}"
     echo -e "${CYAN}====================================================${NC}"
-    echo -e "${YELLOW}1)${NC} Create GOST Tunnel (Secure Port Forward WSS)"
+    echo -e "${YELLOW}1)${NC} Create GOST Tunnel (Secure Port Forward MWS)"
     echo -e "${YELLOW}2)${NC} Create GRE Tunnel (Raw L3)"
     echo -e "${YELLOW}3)${NC} List All Tunnels & Status"
     echo -e "${YELLOW}4)${NC} Ping Connectivity Test (GRE Only)"
