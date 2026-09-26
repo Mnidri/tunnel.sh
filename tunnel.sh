@@ -16,7 +16,7 @@ mkdir -p "${CONFIG_DIR}"
 
 # ----------------- Helper: Detect Public IP -----------------
 get_public_ip() {
-    # دریافت آی‌پی و فیلتر کردن هرگونه کد HTML (فقط اعداد و نقطه مجاز است)
+    # دریافت آی‌پی و فیلتر کردن هرگونه کد HTML
     local IP=$(curl -s4 --max-time 3 api.ipify.org | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$')
     if [ -z "$IP" ]; then
         IP=$(curl -s4 --max-time 3 icanhazip.com | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$')
@@ -24,21 +24,20 @@ get_public_ip() {
     echo "${IP}"
 }
 
-# ----------------- Prerequisites -----------------
+# ----------------- Prerequisites (Anti-Filter Download) -----------------
 install_prerequisites() {
     clear
     echo -e "${CYAN}[*] Verifying system dependencies...${NC}"
     apt update -y >/dev/null 2>&1
     apt install -y curl wget iptables iproute2 net-tools iputils-ping dnsutils tar >/dev/null 2>&1
 
-    # Kernel IP Forwarding
     sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1
     sed -i '/net.ipv4.ip_forward/d' /etc/sysctl.conf
     echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
 
-    # Install GOST binary securely
+    # دانلود هوشمندانه GOST با استفاده از لینک‌های Mirror برای سرور ایران
     if [ ! -f /usr/local/bin/gost ]; then
-        echo -e "${YELLOW}[*] Installing GOST binary...${NC}"
+        echo -e "${YELLOW}[*] Installing GOST binary... (Checking connections)${NC}"
         ARCH=$(uname -m)
         case "$ARCH" in
             x86_64) GOST_ARCH="amd64" ;;
@@ -46,14 +45,22 @@ install_prerequisites() {
             *) echo -e "${RED}[!] Unsupported architecture: $ARCH${NC}"; exit 1 ;;
         esac
         
-        # دانلود و استخراج دقیق فایل بر اساس نام‌گذاری‌های گیت‌هاب
-        wget -qO /tmp/gost.tar.gz "https://github.com/ginuerzh/gost/releases/download/v2.11.5/gost-linux-${GOST_ARCH}-2.11.5.tar.gz"
-        tar -xzf /tmp/gost.tar.gz -C /tmp/
+        GOST_URL="https://github.com/ginuerzh/gost/releases/download/v2.11.5/gost-linux-${GOST_ARCH}-2.11.5.tar.gz"
+        MIRROR_URL="https://mirror.ghproxy.com/${GOST_URL}"
         
-        # انتقال فایل استخراج شده (حتی اگر نام آن طولانی باشد) به نام استاندارد gost
-        find /tmp -type f -name "gost-linux-*" -exec mv {} /usr/local/bin/gost \;
-        chmod +x /usr/local/bin/gost
-        rm -rf /tmp/gost*
+        # تلاش برای دانلود مستقیم، در صورت شکست (ایران) استفاده از میرور
+        wget -q --timeout=5 -O /tmp/gost.tar.gz "${GOST_URL}" || wget -q --timeout=10 -O /tmp/gost.tar.gz "${MIRROR_URL}"
+        
+        if [ -s /tmp/gost.tar.gz ]; then
+            tar -xzf /tmp/gost.tar.gz -C /tmp/
+            find /tmp -type f -name "gost-linux-*" -exec mv {} /usr/local/bin/gost \;
+            chmod +x /usr/local/bin/gost
+            rm -rf /tmp/gost*
+            echo -e "${GREEN}[+] GOST installed successfully.${NC}"
+        else
+            echo -e "${RED}[!] Failed to download GOST. Internet/DNS issue on this server.${NC}"
+            read -p "Press Enter to continue anyway..."
+        fi
     fi
     echo -e "${GREEN}[+] Dependencies are ready.${NC}\n"
     sleep 1
@@ -117,12 +124,10 @@ create_gost_tunnel() {
     read -p "Remote Tunnel IP [default: ${DEF_REMOTE_IP}]: " REMOTE_TUN_IP
     REMOTE_TUN_IP=${REMOTE_TUN_IP:-$DEF_REMOTE_IP}
 
-    # دستورات بدون کوتیشن برای جلوگیری از تداخل systemd
     if [ "$ROLE_NAME" == "SERVER" ]; then
         EXEC_CMD="/usr/local/bin/gost -L tun://:${PORT}?net=${LOCAL_TUN_IP}"
         iptables -I INPUT -p tcp --dport ${PORT} -j ACCEPT 2>/dev/null
     else
-        # کلاینت به صورت مجازی روی یک پورت رندوم لوکال گوش می‌دهد تا ساختار TUN برقرار شود
         EXEC_CMD="/usr/local/bin/gost -L tun://:10443?net=${LOCAL_TUN_IP} -F tcp://${REMOTE_PUB_IP}:${PORT}"
     fi
 
@@ -164,7 +169,7 @@ EOF
     show_summary "${TUN_NAME}"
 }
 
-# ----------------- Create GRE Tunnel -----------------
+# ----------------- Create GRE Tunnel (DO NOT TOUCH - WORKING PERFECTLY) -----------------
 create_gre_tunnel() {
     clear
     echo -e "${CYAN}=== Create GRE Tunnel ===${NC}\n"
@@ -197,7 +202,6 @@ create_gre_tunnel() {
         read -p "Press Enter to return..."; return
     fi
 
-    # استفاده از آی‌پی فیلتر شده و تمیز
     read -p "Local Public IP [default: ${DETECTED_IP}]: " LOCAL_PUB_IP
     LOCAL_PUB_IP=${LOCAL_PUB_IP:-$DETECTED_IP}
 
