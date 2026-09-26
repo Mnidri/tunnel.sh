@@ -1,6 +1,6 @@
 #!/bin/bash
 # ====================================================
-# Multi-Tunnel Manager (GOST & GRE) - Unified Script
+# Multi-Tunnel Manager (GOST & GRE) - Fully Debugged
 # GitHub: https://github.com/Mnidri/tunnel.sh
 # ====================================================
 
@@ -15,21 +15,27 @@ BASE_DIR="/etc/tunnel-core"
 CONFIG_DIR="${BASE_DIR}/configs"
 mkdir -p "${CONFIG_DIR}"
 
+# ----------------- Helper: Detect Public IP -----------------
+get_public_ip() {
+    local IP=$(curl -s4 --max-time 2 ifconfig.me || curl -s4 --max-time 2 api.ipify.org)
+    echo "${IP:-127.0.0.1}"
+}
+
 # ----------------- Prerequisites -----------------
 install_prerequisites() {
     clear
-    echo -e "${CYAN}[*] Checking and installing dependencies...${NC}"
+    echo -e "${CYAN}[*] Verifying system dependencies...${NC}"
     apt update -y >/dev/null 2>&1
     apt install -y curl wget iptables iproute2 net-tools iputils-ping dnsutils tar >/dev/null 2>&1
 
-    # Enable IPv4 Forwarding
+    # Kernel IP Forwarding
     sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1
     sed -i '/net.ipv4.ip_forward/d' /etc/sysctl.conf
     echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
 
-    # Install GOST binary if not found
+    # Install GOST binary if missing
     if [ ! -f /usr/local/bin/gost ]; then
-        echo -e "${YELLOW}[*] Downloading GOST binary...${NC}"
+        echo -e "${YELLOW}[*] Installing GOST binary...${NC}"
         ARCH=$(uname -m)
         case "$ARCH" in
             x86_64) GOST_ARCH="amd64" ;;
@@ -44,40 +50,83 @@ install_prerequisites() {
         chmod +x /usr/local/bin/gost
         rm -rf /tmp/gost*
     fi
-    echo -e "${GREEN}[+] Prerequisites verified successfully.${NC}\n"
+    echo -e "${GREEN}[+] Dependencies are ready.${NC}\n"
     sleep 1
+}
+
+# ----------------- Get Config List -----------------
+get_config_files() {
+    CONFIG_FILES=()
+    for f in "${CONFIG_DIR}"/*.conf; do
+        [ -e "$f" ] && CONFIG_FILES+=("$f")
+    done
 }
 
 # ----------------- Create GOST Tunnel -----------------
 create_gost_tunnel() {
     clear
-    echo -e "${CYAN}=== Create GOST Tunnel (L3 TUN over TCP Mux) ===${NC}"
+    echo -e "${CYAN}=== Create GOST Tunnel (TCP Layer 3 TUN) ===${NC}\n"
     
-    echo -e "\n${YELLOW}Select Server Role:${NC}"
-    echo "1) Server (Foreign / Listener)"
-    echo "2) Client (Iran / Forwarder)"
-    read -p "Select option [1-2]: " SERVER_ROLE
+    echo -e "${YELLOW}Select Server Role:${NC}"
+    echo "1) Foreign Server (Server / Listener)"
+    echo "2) Iran Server (Client / Forwarder)"
+    read -p "Select option [1-2, default: 1]: " SERVER_ROLE
+    SERVER_ROLE=${SERVER_ROLE:-1}
 
-    read -p "Enter Tunnel Name (e.g. tun1): " TUN_NAME
+    # Set paired defaults according to role
+    if [ "$SERVER_ROLE" == "1" ]; then
+        ROLE_NAME="SERVER"
+        DEF_NAME="tun1"
+        DEF_PORT="8443"
+        DEF_LOCAL_IP="10.10.10.1/30"
+        DEF_REMOTE_IP="10.10.10.2"
+    else
+        ROLE_NAME="CLIENT"
+        DEF_NAME="tun1"
+        DEF_PORT="8443"
+        DEF_LOCAL_IP="10.10.10.2/30"
+        DEF_REMOTE_IP="10.10.10.1"
+    fi
+
+    read -p "Tunnel Name [default: ${DEF_NAME}]: " TUN_NAME
+    TUN_NAME=${TUN_NAME:-$DEF_NAME}
+
     if [ -f "${CONFIG_DIR}/${TUN_NAME}.conf" ]; then
-        echo -e "${RED}[!] Error: A tunnel with this name already exists!${NC}"
+        echo -e "${RED}[!] Error: Tunnel '${TUN_NAME}' already exists!${NC}"
         read -p "Press Enter to return..."; return
     fi
 
-    read -p "Enter TCP Port for tunnel traffic (e.g. 8443): " PORT
-    read -p "Enter Local Tunnel IP with CIDR (e.g. 10.10.10.1/30): " LOCAL_TUN_IP
-    read -p "Enter Remote Tunnel IP without CIDR (e.g. 10.10.10.2): " REMOTE_TUN_IP
-    read -p "Enter MTU (Default: 1360): " MTU
+    if [ "$ROLE_NAME" == "CLIENT" ]; then
+        while true; do
+            read -p "Enter Remote Server Public IP (Foreign IP): " REMOTE_PUB_IP
+            if [ -n "$REMOTE_PUB_IP" ]; then break; fi
+            echo -e "${RED}[!] Server IP is required!${NC}"
+        done
+    fi
+
+    read -p "TCP Listen Port [default: ${DEF_PORT}]: " PORT
+    PORT=${PORT:-$DEF_PORT}
+
+    read -p "Local Tunnel IP with CIDR [default: ${DEF_LOCAL_IP}]: " LOCAL_TUN_IP
+    LOCAL_TUN_IP=${LOCAL_TUN_IP:-$DEF_LOCAL_IP}
+
+    read -p "Remote Tunnel IP [default: ${DEF_REMOTE_IP}]: " REMOTE_TUN_IP
+    REMOTE_TUN_IP=${REMOTE_TUN_IP:-$DEF_REMOTE_IP}
+
+    read -p "MTU [default: 1360]: " MTU
     MTU=${MTU:-1360}
 
-    if [ "$SERVER_ROLE" == "1" ]; then
-        ROLE_NAME="SERVER"
-        EXEC_CMD="/usr/local/bin/gost -L \"tun://${TUN_NAME}::${PORT}?net=${LOCAL_TUN_IP}&mtu=${MTU}\""
+    # Format execution command without shell syntax bugs
+    if [ "$ROLE_NAME" == "SERVER" ]; then
+        EXEC_CMD="/usr/local/bin/gost -L tun://:${PORT}?net=${LOCAL_TUN_IP}&name=${TUN_NAME}&mtu=${MTU}"
+        iptables -I INPUT -p tcp --dport ${PORT} -j ACCEPT 2>/dev/null
     else
-        ROLE_NAME="CLIENT"
-        read -p "Enter Remote Server Public IP: " REMOTE_PUB_IP
-        EXEC_CMD="/usr/local/bin/gost -L \"tun://${TUN_NAME}:0?net=${LOCAL_TUN_IP}&mtu=${MTU}\" -F \"tcp://${REMOTE_PUB_IP}:${PORT}\""
+        EXEC_CMD="/usr/local/bin/gost -L tun://:0?net=${LOCAL_TUN_IP}&name=${TUN_NAME}&mtu=${MTU} -F tcp://${REMOTE_PUB_IP}:${PORT}"
     fi
+
+    iptables -I INPUT -i ${TUN_NAME} -j ACCEPT 2>/dev/null
+    iptables -I FORWARD -i ${TUN_NAME} -j ACCEPT 2>/dev/null
+    iptables -I FORWARD -o ${TUN_NAME} -j ACCEPT 2>/dev/null
 
     cat << EOF > /etc/systemd/system/tunnel-${TUN_NAME}.service
 [Unit]
@@ -86,9 +135,10 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=/bin/bash -c '${EXEC_CMD}'
+ExecStart=${EXEC_CMD}
 Restart=always
 RestartSec=3
+LimitNOFILE=65535
 
 [Install]
 WantedBy=multi-user.target
@@ -107,6 +157,7 @@ EOF
 
     systemctl daemon-reload
     systemctl enable --now tunnel-${TUN_NAME}.service >/dev/null 2>&1
+    sleep 2
 
     show_summary "${TUN_NAME}"
 }
@@ -114,28 +165,53 @@ EOF
 # ----------------- Create GRE Tunnel -----------------
 create_gre_tunnel() {
     clear
-    echo -e "${CYAN}=== Create GRE Tunnel ===${NC}"
+    echo -e "${CYAN}=== Create GRE Tunnel ===${NC}\n"
     
-    echo -e "\n${YELLOW}Select Server Role:${NC}"
+    DETECTED_IP=$(get_public_ip)
+
+    echo -e "${YELLOW}Select Server Role:${NC}"
     echo "1) Foreign Server"
     echo "2) Iran Server"
-    read -p "Select option [1-2]: " SERVER_ROLE
+    read -p "Select option [1-2, default: 1]: " SERVER_ROLE
+    SERVER_ROLE=${SERVER_ROLE:-1}
 
-    read -p "Enter Tunnel Name (e.g. gre1): " TUN_NAME
+    if [ "$SERVER_ROLE" == "1" ]; then
+        ROLE_NAME="FOREIGN"
+        DEF_NAME="gre1"
+        DEF_LOCAL_IP="10.20.20.1/30"
+        DEF_REMOTE_IP="10.20.20.2"
+    else
+        ROLE_NAME="IRAN"
+        DEF_NAME="gre1"
+        DEF_LOCAL_IP="10.20.20.2/30"
+        DEF_REMOTE_IP="10.20.20.1"
+    fi
+
+    read -p "Tunnel Name [default: ${DEF_NAME}]: " TUN_NAME
+    TUN_NAME=${TUN_NAME:-$DEF_NAME}
+
     if [ -f "${CONFIG_DIR}/${TUN_NAME}.conf" ]; then
-        echo -e "${RED}[!] Error: A tunnel with this name already exists!${NC}"
+        echo -e "${RED}[!] Error: Tunnel '${TUN_NAME}' already exists!${NC}"
         read -p "Press Enter to return..."; return
     fi
 
-    read -p "Enter Local Public IP of this server: " LOCAL_PUB_IP
-    read -p "Enter Remote Public IP of the other server: " REMOTE_PUB_IP
-    read -p "Enter Local Tunnel IP with CIDR (e.g. 10.20.20.1/30): " LOCAL_TUN_IP
-    read -p "Enter Remote Tunnel IP without CIDR (e.g. 10.20.20.2): " REMOTE_TUN_IP
-    read -p "Enter MTU (Default: 1400): " MTU
-    MTU=${MTU:-1400}
+    read -p "Local Public IP [default: ${DETECTED_IP}]: " LOCAL_PUB_IP
+    LOCAL_PUB_IP=${LOCAL_PUB_IP:-$DETECTED_IP}
 
-    ROLE_NAME="IRAN"
-    [ "$SERVER_ROLE" == "1" ] && ROLE_NAME="FOREIGN"
+    while true; do
+        read -p "Remote Server Public IP: " REMOTE_PUB_IP
+        if [ -n "$REMOTE_PUB_IP" ]; then break; fi
+        echo -e "${RED}[!] Remote Public IP is required!${NC}"
+    done
+
+    read -p "Local Tunnel IP with CIDR [default: ${DEF_LOCAL_IP}]: " LOCAL_TUN_IP
+    LOCAL_TUN_IP=${LOCAL_TUN_IP:-$DEF_LOCAL_IP}
+
+    read -p "Remote Tunnel IP [default: ${DEF_REMOTE_IP}]: " REMOTE_TUN_IP
+    REMOTE_TUN_IP=${REMOTE_TUN_IP:-$DEF_REMOTE_IP}
+
+    read -p "MTU [default: 1400]: " MTU
+    MTU=${MTU:-1400}
 
     cat << EOF > /etc/systemd/system/tunnel-${TUN_NAME}.service
 [Unit]
@@ -171,7 +247,9 @@ EOF
     systemctl daemon-reload
     systemctl enable --now tunnel-${TUN_NAME}.service >/dev/null 2>&1
     iptables -I INPUT -p gre -j ACCEPT 2>/dev/null
-    iptables -I FORWARD -j ACCEPT 2>/dev/null
+    iptables -I INPUT -i ${TUN_NAME} -j ACCEPT 2>/dev/null
+    iptables -I FORWARD -i ${TUN_NAME} -j ACCEPT 2>/dev/null
+    iptables -I FORWARD -o ${TUN_NAME} -j ACCEPT 2>/dev/null
 
     show_summary "${TUN_NAME}"
 }
@@ -181,36 +259,43 @@ show_summary() {
     local NAME=$1
     source "${CONFIG_DIR}/${NAME}.conf"
     
-    echo -e "\n${GREEN}==================================================${NC}"
-    echo -e "${GREEN}           TUNNEL CONFIGURED SUCCESSFULLY         ${NC}"
-    echo -e "${GREEN}==================================================${NC}"
+    IS_ACTIVE=$(systemctl is-active tunnel-${TUN_NAME}.service 2>/dev/null)
+    
+    echo -e "\n${GREEN}====================================================${NC}"
+    echo -e "${GREEN}             TUNNEL CREATED SUCCESSFULLY            ${NC}"
+    echo -e "${GREEN}====================================================${NC}"
     echo -e "Tunnel Identifier : ${CYAN}${TUN_NAME}${NC}"
-    echo -e "Tunnel Protocol   : ${CYAN}${TYPE}${NC}"
+    echo -e "Protocol Type     : ${CYAN}${TYPE}${NC}"
     echo -e "Assigned Role     : ${CYAN}${ROLE}${NC}"
     echo -e "Local Tunnel IP   : ${YELLOW}${LOCAL_TUN_IP}${NC}"
     echo -e "Remote Tunnel IP  : ${YELLOW}${REMOTE_TUN_IP}${NC}"
     [ "$TYPE" == "GOST" ] && echo -e "TCP Listen Port   : ${YELLOW}${PORT}${NC}"
-    [ "$TYPE" == "GOST" ] && echo -e "Remote Target IP  : ${YELLOW}${REMOTE_PUB_IP}${NC}"
-    echo -e "Configured MTU    : ${YELLOW}${MTU}${NC}"
+    [ "$TYPE" == "GOST" ] && [ "$ROLE" == "CLIENT" ] && echo -e "Target Public IP  : ${YELLOW}${REMOTE_PUB_IP}${NC}"
+    echo -e "MTU Size          : ${YELLOW}${MTU}${NC}"
     echo -e "Systemd Service   : ${CYAN}tunnel-${TUN_NAME}.service${NC}"
-    echo -e "${GREEN}==================================================${NC}"
-    echo -e "${YELLOW}Usage in Rathole / Inner Core:${NC}"
-    echo -e "Set your remote peer connection address to: ${CYAN}${REMOTE_TUN_IP}${NC}"
-    echo -e "${GREEN}==================================================${NC}\n"
+    if [ "$IS_ACTIVE" == "active" ]; then
+        echo -e "Current Status    : ${GREEN}Active & Running (UP)${NC}"
+    else
+        echo -e "Current Status    : ${RED}Service Failed - Check Logs${NC}"
+    fi
+    echo -e "${GREEN}====================================================${NC}"
+    echo -e "${YELLOW}[*] How to use inside Rathole or core config:${NC}"
+    echo -e "Set peer target connection IP to: ${CYAN}${REMOTE_TUN_IP}${NC}"
+    echo -e "${GREEN}====================================================${NC}\n"
     read -p "Press Enter to return to main menu..."
 }
 
 # ----------------- List All Tunnels -----------------
 list_tunnels() {
     clear
-    echo -e "${CYAN}=== Active & Registered Tunnels ===${NC}\n"
-    FILES=("${CONFIG_DIR}"/*.conf)
-    if [ ! -e "${FILES[0]}" ]; then
+    echo -e "${CYAN}=== Configured Tunnels Overview ===${NC}\n"
+    get_config_files
+    if [ ${#CONFIG_FILES[@]} -eq 0 ]; then
         echo -e "${YELLOW}No tunnels configured yet.${NC}"
     else
-        printf "%-12s %-8s %-10s %-18s %-12s\n" "NAME" "TYPE" "ROLE" "LOCAL IP" "STATUS"
-        echo "---------------------------------------------------------------"
-        for conf in "${CONFIG_DIR}"/*.conf; do
+        printf "%-12s %-8s %-10s %-18s %-14s\n" "NAME" "TYPE" "ROLE" "LOCAL IP" "STATUS"
+        echo "------------------------------------------------------------------"
+        for conf in "${CONFIG_FILES[@]}"; do
             source "$conf"
             STATUS=$(systemctl is-active tunnel-${TUN_NAME}.service 2>/dev/null)
             if [ "$STATUS" == "active" ]; then
@@ -225,50 +310,74 @@ list_tunnels() {
     read -p "Press Enter to return..."
 }
 
-# ----------------- Ping Test -----------------
+# ----------------- Ping Connectivity Test (Numbered Menu) -----------------
 test_ping() {
     clear
     echo -e "${CYAN}=== Tunnel Connectivity Test (Ping) ===${NC}\n"
-    read -p "Enter Tunnel Name to test: " TUN_NAME
-    
-    if [ ! -f "${CONFIG_DIR}/${TUN_NAME}.conf" ]; then
-        echo -e "${RED}[!] Tunnel '${TUN_NAME}' not found.${NC}"
+    get_config_files
+    if [ ${#CONFIG_FILES[@]} -eq 0 ]; then
+        echo -e "${YELLOW}No tunnels available to test.${NC}"
         read -p "Press Enter to return..."; return
     fi
 
-    source "${CONFIG_DIR}/${TUN_NAME}.conf"
-    echo -e "\n${YELLOW}[*] Sending 4 ICMP packets to Remote Tunnel IP (${REMOTE_TUN_IP})...${NC}\n"
-    ping -c 4 -W 2 "${REMOTE_TUN_IP}"
-    
-    echo -e "\n${GREEN}[+] Ping test complete.${NC}"
+    echo -e "${YELLOW}Select a tunnel to ping:${NC}"
+    for i in "${!CONFIG_FILES[@]}"; do
+        source "${CONFIG_FILES[$i]}"
+        echo -e " ${GREEN}$((i+1)))${NC} ${CYAN}${TUN_NAME}${NC} [${TYPE}] -> Ping Target: ${YELLOW}${REMOTE_TUN_IP}${NC}"
+    done
+    echo -e " ${YELLOW}0)${NC} Back to Main Menu\n"
+
+    read -p "Select number [1-${#CONFIG_FILES[@]}, 0 to exit]: " SEL
+    if [[ "$SEL" =~ ^[0-9]+$ ]] && [ "$SEL" -ge 1 ] && [ "$SEL" -le "${#CONFIG_FILES[@]}" ]; then
+        source "${CONFIG_FILES[$((SEL-1))]}"
+        echo -e "\n${YELLOW}[*] Sending 4 packets to ${REMOTE_TUN_IP} via ${TUN_NAME}...${NC}\n"
+        ping -c 4 -W 2 "${REMOTE_TUN_IP}"
+        echo -e "\n${GREEN}[+] Ping test finished.${NC}"
+    fi
     read -p "Press Enter to return..."
 }
 
-# ----------------- Delete Tunnel -----------------
+# ----------------- Delete Tunnel (Numbered Menu) -----------------
 delete_tunnel() {
     clear
     echo -e "${RED}=== Delete Tunnel ===${NC}\n"
-    read -p "Enter Tunnel Name to delete: " TUN_NAME
-
-    if [ ! -f "${CONFIG_DIR}/${TUN_NAME}.conf" ]; then
-        echo -e "${RED}[!] Tunnel not found.${NC}"
+    get_config_files
+    if [ ${#CONFIG_FILES[@]} -eq 0 ]; then
+        echo -e "${YELLOW}No tunnels found to delete.${NC}"
         read -p "Press Enter to return..."; return
     fi
 
-    source "${CONFIG_DIR}/${TUN_NAME}.conf"
+    echo -e "${YELLOW}Select a tunnel to DELETE:${NC}"
+    for i in "${!CONFIG_FILES[@]}"; do
+        source "${CONFIG_FILES[$i]}"
+        echo -e " ${GREEN}$((i+1)))${NC} ${CYAN}${TUN_NAME}${NC} [${TYPE}] Role: ${ROLE} | IP: ${LOCAL_TUN_IP}"
+    done
+    echo -e " ${YELLOW}0)${NC} Cancel & Back\n"
 
-    systemctl stop tunnel-${TUN_NAME}.service >/dev/null 2>&1
-    systemctl disable tunnel-${TUN_NAME}.service >/dev/null 2>&1
-    rm -f /etc/systemd/system/tunnel-${TUN_NAME}.service
-    systemctl daemon-reload
+    read -p "Select number [1-${#CONFIG_FILES[@]}, 0 to cancel]: " SEL
+    if [[ "$SEL" =~ ^[0-9]+$ ]] && [ "$SEL" -ge 1 ] && [ "$SEL" -le "${#CONFIG_FILES[@]}" ]; then
+        CONF_FILE="${CONFIG_FILES[$((SEL-1))]}"
+        source "$CONF_FILE"
+        read -p "Are you sure you want to delete '${TUN_NAME}'? [y/N]: " CONFIRM
+        if [[ "$CONFIRM" =~ ^[yY]$ ]]; then
+            systemctl stop tunnel-${TUN_NAME}.service >/dev/null 2>&1
+            systemctl disable tunnel-${TUN_NAME}.service >/dev/null 2>&1
+            rm -f /etc/systemd/system/tunnel-${TUN_NAME}.service
+            systemctl daemon-reload
 
-    if [ "$TYPE" == "GRE" ]; then
-        ip link set dev "${TUN_NAME}" down 2>/dev/null
-        ip tunnel del "${TUN_NAME}" 2>/dev/null
+            if [ "$TYPE" == "GRE" ]; then
+                ip link set dev "${TUN_NAME}" down 2>/dev/null
+                ip tunnel del "${TUN_NAME}" 2>/dev/null
+            elif [ "$TYPE" == "GOST" ]; then
+                ip link set dev "${TUN_NAME}" down 2>/dev/null
+            fi
+
+            rm -f "$CONF_FILE"
+            echo -e "${GREEN}[+] Tunnel '${TUN_NAME}' completely removed.${NC}"
+        else
+            echo -e "${YELLOW}[*] Deletion aborted.${NC}"
+        fi
     fi
-
-    rm -f "${CONFIG_DIR}/${TUN_NAME}.conf"
-    echo -e "\n${GREEN}[+] Tunnel '${TUN_NAME}' deleted and network state cleaned.${NC}"
     read -p "Press Enter to return..."
 }
 
@@ -291,17 +400,17 @@ install_prerequisites
 
 while true; do
     clear
-    echo -e "${CYAN}==================================================${NC}"
-    echo -e "${CYAN}        Multi-Tunnel Manager (GOST & GRE)         ${NC}"
-    echo -e "${CYAN}==================================================${NC}"
-    echo -e "${YELLOW}1)${NC} Create GOST Tunnel (TCP Layer 3 - Anti UDP-Drop)"
+    echo -e "${CYAN}====================================================${NC}"
+    echo -e "${CYAN}         Multi-Tunnel Manager (GOST & GRE)          ${NC}"
+    echo -e "${CYAN}====================================================${NC}"
+    echo -e "${YELLOW}1)${NC} Create GOST Tunnel (TCP Layer 3 - Recommended)"
     echo -e "${YELLOW}2)${NC} Create GRE Tunnel (Raw L3)"
-    echo -e "${YELLOW}3)${NC} List Tunnels & Status"
+    echo -e "${YELLOW}3)${NC} List All Tunnels & Status"
     echo -e "${YELLOW}4)${NC} Ping Connectivity Test"
     echo -e "${YELLOW}5)${NC} Delete a Tunnel"
     echo -e "${YELLOW}6)${NC} Optimize Network (Enable BBR)"
     echo -e "${YELLOW}0)${NC} Exit"
-    echo -e "${CYAN}==================================================${NC}"
+    echo -e "${CYAN}====================================================${NC}"
     read -p "Choose an option [0-6]: " OPTION
 
     case $OPTION in
