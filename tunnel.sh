@@ -1,6 +1,6 @@
 #!/bin/bash
 # ====================================================
-# Multi-Tunnel Manager (GRE Classic + GOST MWS)
+# Multi-Tunnel Manager (Classic Stable Core)
 # GitHub: https://github.com/Mnidri/tunnel.sh
 # ====================================================
 
@@ -16,9 +16,9 @@ mkdir -p "${CONFIG_DIR}"
 
 # ----------------- Helper: Detect Public IP -----------------
 get_public_ip() {
-    local IP=$(curl -s4 --max-time 3 api.ipify.org | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$')
+    local IP=$(curl -s4 --max-time 2 api.ipify.org | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$')
     if [ -z "$IP" ]; then
-        IP=$(curl -s4 --max-time 3 icanhazip.com | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$')
+        IP=$(curl -s4 --max-time 2 icanhazip.com | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$')
     fi
     echo "${IP}"
 }
@@ -50,7 +50,6 @@ install_prerequisites() {
         
         rm -f /tmp/gost*
         
-        echo -e "${CYAN} -> Fetching GOST (${GOST_ARCH})...${NC}"
         if ! curl -sSL -f -o /tmp/gost.gz "${GOST_URL}"; then
             if ! curl -sSL -f -o /tmp/gost.gz "${MIRROR1}"; then
                 curl -sSL -f -o /tmp/gost.gz "${MIRROR2}"
@@ -59,14 +58,8 @@ install_prerequisites() {
         
         if [ -s /tmp/gost.gz ]; then
             gzip -df /tmp/gost.gz
-            if [ -f /tmp/gost ]; then
-                mv /tmp/gost /usr/local/bin/gost
-                chmod +x /usr/local/bin/gost
-                echo -e "${GREEN}[+] GOST installed successfully.${NC}"
-            else
-                echo -e "${RED}[!] Extraction failed. File might be corrupted.${NC}"
-                rm -f /tmp/gost*
-            fi
+            mv /tmp/gost /usr/local/bin/gost
+            chmod +x /usr/local/bin/gost
         fi
     fi
     echo -e "${GREEN}[+] Dependencies are ready.${NC}\n"
@@ -91,8 +84,11 @@ create_gost_pf() {
     read -p "Select option [1-2, default: 1]: " SERVER_ROLE
     SERVER_ROLE=${SERVER_ROLE:-1}
 
-    ROLE_NAME="SERVER"
-    [ "$SERVER_ROLE" == "2" ] && ROLE_NAME="CLIENT"
+    if [ "$SERVER_ROLE" == "1" ]; then
+        ROLE_NAME="SERVER"
+    else
+        ROLE_NAME="CLIENT"
+    fi
 
     read -p "Tunnel Name [default: gost_pf1]: " TUN_NAME
     TUN_NAME=${TUN_NAME:-gost_pf1}
@@ -109,7 +105,7 @@ create_gost_pf() {
     AUTH_PASS=${AUTH_PASS:-Pass123!}
 
     echo -e "\n${YELLOW}--- Port Configuration ---${NC}"
-    read -p "Tunnel Port (between servers) [default: 8080]: " TUN_PORT
+    read -p "MWS Tunnel Port (between servers) [default: 8080]: " TUN_PORT
     TUN_PORT=${TUN_PORT:-8080}
 
     APP_PORT="N/A"
@@ -125,9 +121,9 @@ create_gost_pf() {
             if [ -n "$REMOTE_PUB_IP" ]; then break; fi
             echo -e "${RED}[!] Server IP is required!${NC}"
         done
-        read -p "Port to forward (e.g. Xray panel port) [default: 2333]: " APP_PORT
+        read -p "Port you want to forward (e.g. Xray panel port) [default: 2333]: " APP_PORT
         APP_PORT=${APP_PORT:-2333}
-        read -p "Target IP on Foreign Server [default: 127.0.0.1]: " TARGET_IP
+        read -p "Target IP on Foreign Server (Hit Enter for 127.0.0.1 or enter Foreign IP): " TARGET_IP
         TARGET_IP=${TARGET_IP:-127.0.0.1}
         
         EXEC_CMD="/usr/local/bin/gost -L tcp://:${APP_PORT}/${TARGET_IP}:${APP_PORT} -L udp://:${APP_PORT}/${TARGET_IP}:${APP_PORT} -F relay+mws://${AUTH_USER}:${AUTH_PASS}@${REMOTE_PUB_IP}:${TUN_PORT}"
@@ -142,8 +138,7 @@ After=network.target
 
 [Service]
 Type=simple
-User=root
-ExecStart=${EXEC_CMD}
+ExecStart=/bin/bash -c '${EXEC_CMD}'
 Restart=always
 RestartSec=3
 LimitNOFILE=65535
@@ -170,7 +165,7 @@ EOF
     show_summary "${TUN_NAME}"
 }
 
-# ----------------- 2. Create GRE Tunnel (CLASSIC UNTOUCHED VERSION) -----------------
+# ----------------- 2. Create GRE Tunnel (CLASSIC UNTOUCHED) -----------------
 create_gre_tunnel() {
     clear
     echo -e "${CYAN}=== Create GRE Tunnel (Raw L3) ===${NC}\n"
