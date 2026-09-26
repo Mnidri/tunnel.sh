@@ -1,6 +1,6 @@
 #!/bin/bash
 # ====================================================
-# Multi-Tunnel Manager (GOST MWS PF & GRE) - V4
+# Multi-Tunnel Manager (GRE Classic + GOST MWS)
 # GitHub: https://github.com/Mnidri/tunnel.sh
 # ====================================================
 
@@ -14,6 +14,7 @@ BASE_DIR="/etc/tunnel-core"
 CONFIG_DIR="${BASE_DIR}/configs"
 mkdir -p "${CONFIG_DIR}"
 
+# ----------------- Helper: Detect Public IP -----------------
 get_public_ip() {
     local IP=$(curl -s4 --max-time 3 api.ipify.org | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$')
     if [ -z "$IP" ]; then
@@ -22,6 +23,7 @@ get_public_ip() {
     echo "${IP}"
 }
 
+# ----------------- Prerequisites -----------------
 install_prerequisites() {
     clear
     echo -e "${CYAN}[*] Verifying system dependencies...${NC}"
@@ -65,8 +67,6 @@ install_prerequisites() {
                 echo -e "${RED}[!] Extraction failed. File might be corrupted.${NC}"
                 rm -f /tmp/gost*
             fi
-        else
-            echo -e "${RED}[!] Critical: Failed to download GOST.${NC}"
         fi
     fi
     echo -e "${GREEN}[+] Dependencies are ready.${NC}\n"
@@ -80,11 +80,10 @@ get_config_files() {
     done
 }
 
-# ----------------- 1. Create GOST Port Forward (L4 MWS) -----------------
+# ----------------- 1. Create GOST Port Forward (MWS) -----------------
 create_gost_pf() {
     clear
-    echo -e "${CYAN}=== Create GOST Port Forward (Multiplex WebSocket - MWS) ===${NC}"
-    echo -e "${YELLOW}Bypasses DPI TLS-Handshake blocks perfectly.${NC}\n"
+    echo -e "${CYAN}=== Create GOST Port Forward (MWS Secure Relay) ===${NC}\n"
     
     echo -e "${YELLOW}Select Server Role:${NC}"
     echo "1) Foreign Server (Server / Listener)"
@@ -110,7 +109,7 @@ create_gost_pf() {
     AUTH_PASS=${AUTH_PASS:-Pass123!}
 
     echo -e "\n${YELLOW}--- Port Configuration ---${NC}"
-    read -p "MWS Tunnel Port (between servers) [default: 8080]: " TUN_PORT
+    read -p "Tunnel Port (between servers) [default: 8080]: " TUN_PORT
     TUN_PORT=${TUN_PORT:-8080}
 
     APP_PORT="N/A"
@@ -126,26 +125,16 @@ create_gost_pf() {
             if [ -n "$REMOTE_PUB_IP" ]; then break; fi
             echo -e "${RED}[!] Server IP is required!${NC}"
         done
-        read -p "Port you want to forward (e.g. your panel port) [default: 2333]: " APP_PORT
+        read -p "Port to forward (e.g. Xray panel port) [default: 2333]: " APP_PORT
         APP_PORT=${APP_PORT:-2333}
         read -p "Target IP on Foreign Server [default: 127.0.0.1]: " TARGET_IP
         TARGET_IP=${TARGET_IP:-127.0.0.1}
         
-        # Changed relay+wss to relay+mws
         EXEC_CMD="/usr/local/bin/gost -L tcp://:${APP_PORT}/${TARGET_IP}:${APP_PORT} -L udp://:${APP_PORT}/${TARGET_IP}:${APP_PORT} -F relay+mws://${AUTH_USER}:${AUTH_PASS}@${REMOTE_PUB_IP}:${TUN_PORT}"
         iptables -I INPUT -p tcp --dport ${APP_PORT} -j ACCEPT 2>/dev/null
         iptables -I INPUT -p udp --dport ${APP_PORT} -j ACCEPT 2>/dev/null
     fi
 
-    generate_gost_service
-    save_gost_config
-    start_service
-
-    echo -e "\n${GREEN}=== GOST Port Forward Created ===${NC}"
-    read -p "Press Enter to return..."
-}
-
-generate_gost_service() {
     cat << EOF > /etc/systemd/system/tunnel-${TUN_NAME}.service
 [Unit]
 Description=GOST Port Forward - ${TUN_NAME}
@@ -162,9 +151,7 @@ LimitNOFILE=65535
 [Install]
 WantedBy=multi-user.target
 EOF
-}
 
-save_gost_config() {
     cat << EOF > "${CONFIG_DIR}/${TUN_NAME}.conf"
 TYPE="GOST_PF"
 ROLE="${ROLE_NAME}"
@@ -176,15 +163,14 @@ APP_PORT="${APP_PORT}"
 TARGET_IP="${TARGET_IP}"
 REMOTE_PUB_IP="${REMOTE_PUB_IP}"
 EOF
-}
 
-start_service() {
     systemctl daemon-reload
     systemctl enable --now tunnel-${TUN_NAME}.service >/dev/null 2>&1
     sleep 2
+    show_summary "${TUN_NAME}"
 }
 
-# ----------------- 2. Create GRE Tunnel -----------------
+# ----------------- 2. Create GRE Tunnel (CLASSIC UNTOUCHED VERSION) -----------------
 create_gre_tunnel() {
     clear
     echo -e "${CYAN}=== Create GRE Tunnel (Raw L3) ===${NC}\n"
@@ -235,20 +221,6 @@ create_gre_tunnel() {
     read -p "MTU [default: 1400]: " MTU
     MTU=${MTU:-1400}
 
-    generate_gre_service
-    save_gre_config
-    start_service
-
-    iptables -I INPUT -p gre -j ACCEPT 2>/dev/null
-    iptables -I INPUT -i ${TUN_NAME} -j ACCEPT 2>/dev/null
-    iptables -I FORWARD -i ${TUN_NAME} -j ACCEPT 2>/dev/null
-    iptables -I FORWARD -o ${TUN_NAME} -j ACCEPT 2>/dev/null
-
-    echo -e "\n${GREEN}=== GRE Tunnel Created ===${NC}"
-    read -p "Press Enter to return..."
-}
-
-generate_gre_service() {
     cat << EOF > /etc/systemd/system/tunnel-${TUN_NAME}.service
 [Unit]
 Description=GRE Tunnel - ${TUN_NAME}
@@ -270,9 +242,7 @@ RemainAfterExit=yes
 [Install]
 WantedBy=multi-user.target
 EOF
-}
 
-save_gre_config() {
     cat << EOF > "${CONFIG_DIR}/${TUN_NAME}.conf"
 TYPE="GRE"
 ROLE="${ROLE_NAME}"
@@ -283,9 +253,54 @@ LOCAL_TUN_IP="${LOCAL_TUN_IP}"
 REMOTE_TUN_IP="${REMOTE_TUN_IP}"
 MTU="${MTU}"
 EOF
+
+    systemctl daemon-reload
+    systemctl enable --now tunnel-${TUN_NAME}.service >/dev/null 2>&1
+    iptables -I INPUT -p gre -j ACCEPT 2>/dev/null
+    iptables -I INPUT -i ${TUN_NAME} -j ACCEPT 2>/dev/null
+    iptables -I FORWARD -i ${TUN_NAME} -j ACCEPT 2>/dev/null
+    iptables -I FORWARD -o ${TUN_NAME} -j ACCEPT 2>/dev/null
+    sleep 2
+
+    show_summary "${TUN_NAME}"
 }
 
-# ----------------- Status, Ping, Edit, Delete -----------------
+# ----------------- Summary Screen -----------------
+show_summary() {
+    local NAME=$1
+    source "${CONFIG_DIR}/${NAME}.conf"
+    
+    IS_ACTIVE=$(systemctl is-active tunnel-${TUN_NAME}.service 2>/dev/null)
+    
+    echo -e "\n${GREEN}====================================================${NC}"
+    echo -e "${GREEN}             TUNNEL CREATED SUCCESSFULLY            ${NC}"
+    echo -e "${GREEN}====================================================${NC}"
+    echo -e "Tunnel Name       : ${CYAN}${TUN_NAME}${NC}"
+    echo -e "Protocol Type     : ${CYAN}${TYPE}${NC}"
+    echo -e "Assigned Role     : ${CYAN}${ROLE}${NC}"
+    
+    if [ "$TYPE" == "GRE" ]; then
+        echo -e "Local Tunnel IP   : ${YELLOW}${LOCAL_TUN_IP}${NC}"
+        echo -e "Remote Tunnel IP  : ${YELLOW}${REMOTE_TUN_IP}${NC}"
+        echo -e "MTU Size          : ${YELLOW}${MTU}${NC}"
+    else
+        [ "$ROLE" == "SERVER" ] && echo -e "MWS Listen Port   : ${YELLOW}${TUN_PORT}${NC}"
+        [ "$ROLE" == "CLIENT" ] && echo -e "Forwarded Port    : ${YELLOW}${APP_PORT} -> ${TUN_PORT}${NC}"
+        [ "$ROLE" == "CLIENT" ] && echo -e "Target IP on exit : ${YELLOW}${TARGET_IP}${NC}"
+    fi
+
+    echo -e "Systemd Service   : ${CYAN}tunnel-${TUN_NAME}.service${NC}"
+    
+    if [ "$IS_ACTIVE" == "active" ]; then
+        echo -e "Current Status    : ${GREEN}Active & Running (UP)${NC}"
+    else
+        echo -e "Current Status    : ${RED}Service Failed - Check Logs${NC}"
+    fi
+    echo -e "${GREEN}====================================================${NC}\n"
+    read -p "Press Enter to return to main menu..."
+}
+
+# ----------------- Status, Ping, Delete -----------------
 list_tunnels() {
     clear
     echo -e "${CYAN}=== Configured Tunnels Overview ===${NC}\n"
@@ -346,80 +361,6 @@ test_ping() {
         echo -e "\n${YELLOW}[*] Sending 4 packets to ${REMOTE_TUN_IP} via ${TUN_NAME}...${NC}\n"
         ping -c 4 -W 2 "${REMOTE_TUN_IP}"
         echo -e "\n${GREEN}[+] Ping test finished.${NC}"
-    fi
-    read -p "Press Enter to return..."
-}
-
-edit_tunnel() {
-    clear
-    echo -e "${CYAN}=== Edit Existing Tunnel ===${NC}\n"
-    get_config_files
-    if [ ${#CONFIG_FILES[@]} -eq 0 ]; then
-        echo -e "${YELLOW}No tunnels found to edit.${NC}"
-        read -p "Press Enter to return..."; return
-    fi
-
-    for i in "${!CONFIG_FILES[@]}"; do
-        source "${CONFIG_FILES[$i]}"
-        echo -e " ${GREEN}$((i+1)))${NC} ${CYAN}${TUN_NAME}${NC} [${TYPE}] Role: ${ROLE}"
-    done
-    echo -e " ${YELLOW}0)${NC} Cancel & Back\n"
-
-    read -p "Select tunnel to edit [1-${#CONFIG_FILES[@]}, 0 to cancel]: " SEL
-    if [[ "$SEL" =~ ^[0-9]+$ ]] && [ "$SEL" -ge 1 ] && [ "$SEL" -le "${#CONFIG_FILES[@]}" ]; then
-        CONF_FILE="${CONFIG_FILES[$((SEL-1))]}"
-        source "$CONF_FILE"
-        
-        echo -e "\n${CYAN}Editing: ${TUN_NAME} (${TYPE})${NC}"
-        echo -e "${YELLOW}Press ENTER to keep the current value.${NC}\n"
-
-        if [ "$TYPE" == "GOST_PF" ]; then
-            read -p "Username [${AUTH_USER}]: " NEW_AUTH_USER
-            AUTH_USER=${NEW_AUTH_USER:-$AUTH_USER}
-            read -p "Password [${AUTH_PASS}]: " NEW_AUTH_PASS
-            AUTH_PASS=${NEW_AUTH_PASS:-$AUTH_PASS}
-            read -p "MWS Tunnel Port [${TUN_PORT}]: " NEW_TUN_PORT
-            TUN_PORT=${NEW_TUN_PORT:-$TUN_PORT}
-
-            if [ "$ROLE" == "CLIENT" ]; then
-                read -p "Remote Server Public IP [${REMOTE_PUB_IP}]: " NEW_REMOTE_PUB_IP
-                REMOTE_PUB_IP=${NEW_REMOTE_PUB_IP:-$REMOTE_PUB_IP}
-                read -p "Forwarded App Port [${APP_PORT}]: " NEW_APP_PORT
-                APP_PORT=${NEW_APP_PORT:-$APP_PORT}
-                read -p "Target IP on Foreign Server [${TARGET_IP}]: " NEW_TARGET_IP
-                TARGET_IP=${NEW_TARGET_IP:-$TARGET_IP}
-                
-                EXEC_CMD="/usr/local/bin/gost -L tcp://:${APP_PORT}/${TARGET_IP}:${APP_PORT} -L udp://:${APP_PORT}/${TARGET_IP}:${APP_PORT} -F relay+mws://${AUTH_USER}:${AUTH_PASS}@${REMOTE_PUB_IP}:${TUN_PORT}"
-            else
-                EXEC_CMD="/usr/local/bin/gost -L relay+mws://${AUTH_USER}:${AUTH_PASS}@:${TUN_PORT}"
-            fi
-            
-            generate_gost_service
-            save_gost_config
-
-        elif [ "$TYPE" == "GRE" ]; then
-            read -p "Local Public IP [${LOCAL_PUB_IP}]: " NEW_LOCAL_PUB_IP
-            LOCAL_PUB_IP=${NEW_LOCAL_PUB_IP:-$LOCAL_PUB_IP}
-            read -p "Remote Server Public IP [${REMOTE_PUB_IP}]: " NEW_REMOTE_PUB_IP
-            REMOTE_PUB_IP=${NEW_REMOTE_PUB_IP:-$REMOTE_PUB_IP}
-            read -p "Local Tunnel IP [${LOCAL_TUN_IP}]: " NEW_LOCAL_TUN_IP
-            LOCAL_TUN_IP=${NEW_LOCAL_TUN_IP:-$LOCAL_TUN_IP}
-            read -p "Remote Tunnel IP [${REMOTE_TUN_IP}]: " NEW_REMOTE_TUN_IP
-            REMOTE_TUN_IP=${NEW_REMOTE_TUN_IP:-$REMOTE_TUN_IP}
-            read -p "MTU [${MTU}]: " NEW_MTU
-            MTU=${NEW_MTU:-$MTU}
-
-            systemctl stop tunnel-${TUN_NAME}.service >/dev/null 2>&1
-            ip link set dev "${TUN_NAME}" down 2>/dev/null
-            ip tunnel del "${TUN_NAME}" 2>/dev/null
-            
-            generate_gre_service
-            save_gre_config
-        fi
-
-        systemctl daemon-reload
-        systemctl restart tunnel-${TUN_NAME}.service
-        echo -e "\n${GREEN}[+] Tunnel '${TUN_NAME}' successfully updated and restarted.${NC}"
     fi
     read -p "Press Enter to return..."
 }
@@ -486,27 +427,25 @@ install_prerequisites
 while true; do
     clear
     echo -e "${CYAN}====================================================${NC}"
-    echo -e "${CYAN}         Tunnel Manager (GOST MWS & GRE)            ${NC}"
+    echo -e "${CYAN}       Tunnel Manager (GRE Classic & GOST MWS)      ${NC}"
     echo -e "${CYAN}====================================================${NC}"
     echo -e "${YELLOW}1)${NC} Create GOST Tunnel (Secure Port Forward MWS)"
     echo -e "${YELLOW}2)${NC} Create GRE Tunnel (Raw L3)"
     echo -e "${YELLOW}3)${NC} List All Tunnels & Status"
     echo -e "${YELLOW}4)${NC} Ping Connectivity Test (GRE Only)"
-    echo -e "${YELLOW}5)${NC} Edit an Existing Tunnel"
-    echo -e "${YELLOW}6)${NC} Delete a Tunnel"
-    echo -e "${YELLOW}7)${NC} Optimize Network (Enable BBR)"
+    echo -e "${YELLOW}5)${NC} Delete a Tunnel"
+    echo -e "${YELLOW}6)${NC} Optimize Network (Enable BBR)"
     echo -e "${YELLOW}0)${NC} Exit"
     echo -e "${CYAN}====================================================${NC}"
-    read -p "Choose an option [0-7]: " OPTION
+    read -p "Choose an option [0-6]: " OPTION
 
     case $OPTION in
         1) create_gost_pf ;;
         2) create_gre_tunnel ;;
         3) list_tunnels ;;
         4) test_ping ;;
-        5) edit_tunnel ;;
-        6) delete_tunnel ;;
-        7) optimize_system ;;
+        5) delete_tunnel ;;
+        6) optimize_system ;;
         0) clear; exit 0 ;;
         *) echo -e "${RED}[!] Invalid option!${NC}"; sleep 1 ;;
     esac
