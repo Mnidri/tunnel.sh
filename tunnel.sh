@@ -1,13 +1,12 @@
 #!/bin/bash
 # ====================================================
-# Multi-Tunnel Manager (GOST & GRE) - Fully Debugged
+# Multi-Tunnel Manager (GOST & GRE) - Fully Fixed
 # GitHub: https://github.com/Mnidri/tunnel.sh
 # ====================================================
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
 CYAN='\033[0;36m'
 NC='\033[0m'
 
@@ -17,8 +16,12 @@ mkdir -p "${CONFIG_DIR}"
 
 # ----------------- Helper: Detect Public IP -----------------
 get_public_ip() {
-    local IP=$(curl -s4 --max-time 2 ifconfig.me || curl -s4 --max-time 2 api.ipify.org)
-    echo "${IP:-127.0.0.1}"
+    # دریافت آی‌پی و فیلتر کردن هرگونه کد HTML (فقط اعداد و نقطه مجاز است)
+    local IP=$(curl -s4 --max-time 3 api.ipify.org | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$')
+    if [ -z "$IP" ]; then
+        IP=$(curl -s4 --max-time 3 icanhazip.com | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$')
+    fi
+    echo "${IP}"
 }
 
 # ----------------- Prerequisites -----------------
@@ -28,10 +31,12 @@ install_prerequisites() {
     apt update -y >/dev/null 2>&1
     apt install -y curl wget iptables iproute2 net-tools iputils-ping dnsutils tar >/dev/null 2>&1
 
+    # Kernel IP Forwarding
     sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1
     sed -i '/net.ipv4.ip_forward/d' /etc/sysctl.conf
     echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
 
+    # Install GOST binary securely
     if [ ! -f /usr/local/bin/gost ]; then
         echo -e "${YELLOW}[*] Installing GOST binary...${NC}"
         ARCH=$(uname -m)
@@ -41,9 +46,12 @@ install_prerequisites() {
             *) echo -e "${RED}[!] Unsupported architecture: $ARCH${NC}"; exit 1 ;;
         esac
         
+        # دانلود و استخراج دقیق فایل بر اساس نام‌گذاری‌های گیت‌هاب
         wget -qO /tmp/gost.tar.gz "https://github.com/ginuerzh/gost/releases/download/v2.11.5/gost-linux-${GOST_ARCH}-2.11.5.tar.gz"
         tar -xzf /tmp/gost.tar.gz -C /tmp/
-        mv /tmp/gost /usr/local/bin/gost
+        
+        # انتقال فایل استخراج شده (حتی اگر نام آن طولانی باشد) به نام استاندارد gost
+        find /tmp -type f -name "gost-linux-*" -exec mv {} /usr/local/bin/gost \;
         chmod +x /usr/local/bin/gost
         rm -rf /tmp/gost*
     fi
@@ -109,11 +117,13 @@ create_gost_tunnel() {
     read -p "Remote Tunnel IP [default: ${DEF_REMOTE_IP}]: " REMOTE_TUN_IP
     REMOTE_TUN_IP=${REMOTE_TUN_IP:-$DEF_REMOTE_IP}
 
+    # دستورات بدون کوتیشن برای جلوگیری از تداخل systemd
     if [ "$ROLE_NAME" == "SERVER" ]; then
-        EXEC_CMD="/usr/local/bin/gost -L \"tun://:${PORT}?net=${LOCAL_TUN_IP}\""
+        EXEC_CMD="/usr/local/bin/gost -L tun://:${PORT}?net=${LOCAL_TUN_IP}"
         iptables -I INPUT -p tcp --dport ${PORT} -j ACCEPT 2>/dev/null
     else
-        EXEC_CMD="/usr/local/bin/gost -L \"tun://:0?net=${LOCAL_TUN_IP}\" -F \"tcp://${REMOTE_PUB_IP}:${PORT}\""
+        # کلاینت به صورت مجازی روی یک پورت رندوم لوکال گوش می‌دهد تا ساختار TUN برقرار شود
+        EXEC_CMD="/usr/local/bin/gost -L tun://:10443?net=${LOCAL_TUN_IP} -F tcp://${REMOTE_PUB_IP}:${PORT}"
     fi
 
     iptables -I INPUT -i tun+ -j ACCEPT 2>/dev/null
@@ -127,7 +137,8 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=/bin/bash -c '${EXEC_CMD}'
+User=root
+ExecStart=${EXEC_CMD}
 Restart=always
 RestartSec=3
 LimitNOFILE=65535
@@ -148,7 +159,7 @@ EOF
 
     systemctl daemon-reload
     systemctl enable --now tunnel-${TUN_NAME}.service >/dev/null 2>&1
-    sleep 2
+    sleep 3
 
     show_summary "${TUN_NAME}"
 }
@@ -186,6 +197,7 @@ create_gre_tunnel() {
         read -p "Press Enter to return..."; return
     fi
 
+    # استفاده از آی‌پی فیلتر شده و تمیز
     read -p "Local Public IP [default: ${DETECTED_IP}]: " LOCAL_PUB_IP
     LOCAL_PUB_IP=${LOCAL_PUB_IP:-$DETECTED_IP}
 
@@ -243,6 +255,7 @@ EOF
     iptables -I INPUT -i ${TUN_NAME} -j ACCEPT 2>/dev/null
     iptables -I FORWARD -i ${TUN_NAME} -j ACCEPT 2>/dev/null
     iptables -I FORWARD -o ${TUN_NAME} -j ACCEPT 2>/dev/null
+    sleep 2
 
     show_summary "${TUN_NAME}"
 }
@@ -266,10 +279,11 @@ show_summary() {
     [ "$TYPE" == "GOST" ] && [ "$ROLE" == "CLIENT" ] && echo -e "Target Public IP  : ${YELLOW}${REMOTE_PUB_IP}${NC}"
     [ "$TYPE" == "GRE" ] && echo -e "MTU Size          : ${YELLOW}${MTU}${NC}"
     echo -e "Systemd Service   : ${CYAN}tunnel-${TUN_NAME}.service${NC}"
+    
     if [ "$IS_ACTIVE" == "active" ]; then
         echo -e "Current Status    : ${GREEN}Active & Running (UP)${NC}"
     else
-        echo -e "Current Status    : ${RED}Service Failed - Check Logs${NC}"
+        echo -e "Current Status    : ${RED}Service Failed - Check Logs (journalctl -u tunnel-${TUN_NAME}.service)${NC}"
     fi
     echo -e "${GREEN}====================================================${NC}"
     echo -e "${YELLOW}[*] How to use inside Rathole or core config:${NC}"
