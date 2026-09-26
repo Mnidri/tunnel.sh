@@ -23,7 +23,7 @@ get_public_ip() {
     echo "${IP}"
 }
 
-# ----------------- Prerequisites (Fixed Download Logic) -----------------
+# ----------------- Prerequisites (Fixed ARM Download) -----------------
 install_prerequisites() {
     clear
     echo -e "${CYAN}[*] Verifying system dependencies...${NC}"
@@ -39,20 +39,27 @@ install_prerequisites() {
         ARCH=$(uname -m)
         case "$ARCH" in
             x86_64) GOST_ARCH="amd64" ;;
-            aarch64) GOST_ARCH="arm64" ;;
-            *) echo -e "${RED}[!] Unsupported architecture: $ARCH${NC}"; exit 1 ;;
+            aarch64|arm64) GOST_ARCH="armv8" ;; # GOST uses armv8 for aarch64
+            armv7l|armv7) GOST_ARCH="armv7" ;;
+            *) GOST_ARCH="amd64" ;; # Fallback
         esac
         
-        # فرمت فایل‌های GOST در گیت‌هاب .gz است
         GOST_URL="https://github.com/ginuerzh/gost/releases/download/v2.11.5/gost-linux-${GOST_ARCH}-2.11.5.gz"
-        MIRROR_URL="https://mirror.ghproxy.com/${GOST_URL}"
+        MIRROR1="https://mirror.ghproxy.com/${GOST_URL}"
+        MIRROR2="https://ghproxy.net/${GOST_URL}"
         
         rm -f /tmp/gost*
         
-        # تلاش برای دانلود مستقیم
-        if ! wget -q --show-progress --timeout=10 -O /tmp/gost.gz "${GOST_URL}"; then
-            echo -e "${YELLOW}[*] Direct download failed. Trying Anti-Filter Mirror...${NC}"
-            wget -q --show-progress --timeout=15 -O /tmp/gost.gz "${MIRROR_URL}"
+        # 1. Try Direct GitHub
+        echo -e "${CYAN} -> Fetching GOST (${GOST_ARCH}) from GitHub...${NC}"
+        if ! curl -sSL -f -o /tmp/gost.gz "${GOST_URL}"; then
+            # 2. Try Mirror 1
+            echo -e "${YELLOW} -> GitHub blocked/failed. Trying Mirror 1...${NC}"
+            if ! curl -sSL -f -o /tmp/gost.gz "${MIRROR1}"; then
+                # 3. Try Mirror 2
+                echo -e "${YELLOW} -> Mirror 1 failed. Trying Mirror 2...${NC}"
+                curl -sSL -f -o /tmp/gost.gz "${MIRROR2}"
+            fi
         fi
         
         if [ -s /tmp/gost.gz ]; then
@@ -62,11 +69,11 @@ install_prerequisites() {
                 chmod +x /usr/local/bin/gost
                 echo -e "${GREEN}[+] GOST installed successfully.${NC}"
             else
-                echo -e "${RED}[!] Extraction failed. Downloaded file might be corrupted.${NC}"
+                echo -e "${RED}[!] Extraction failed. File might be corrupted.${NC}"
                 rm -f /tmp/gost*
             fi
         else
-            echo -e "${RED}[!] Failed to download GOST. Check server internet access.${NC}"
+            echo -e "${RED}[!] Critical: Failed to download GOST from all sources.${NC}"
         fi
     fi
     echo -e "${GREEN}[+] Dependencies are ready.${NC}\n"
