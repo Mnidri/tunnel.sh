@@ -1,6 +1,6 @@
 #!/bin/bash
 # ====================================================
-# Multi-Tunnel Manager (GOST & GRE) - Fully Fixed Ping
+# Multi-Tunnel Manager (GOST PF, GRE, WireGuard)
 # GitHub: https://github.com/Mnidri/tunnel.sh
 # ====================================================
 
@@ -28,7 +28,7 @@ install_prerequisites() {
     clear
     echo -e "${CYAN}[*] Verifying system dependencies...${NC}"
     apt update -y >/dev/null 2>&1
-    apt install -y curl wget iptables iproute2 net-tools iputils-ping dnsutils gzip >/dev/null 2>&1
+    apt install -y curl wget iptables iproute2 net-tools iputils-ping dnsutils gzip wireguard wireguard-tools >/dev/null 2>&1
 
     sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1
     sed -i '/net.ipv4.ip_forward/d' /etc/sysctl.conf
@@ -77,7 +77,6 @@ install_prerequisites() {
     sleep 1
 }
 
-# ----------------- Get Config List -----------------
 get_config_files() {
     CONFIG_FILES=()
     for f in "${CONFIG_DIR}"/*.conf; do
@@ -85,10 +84,11 @@ get_config_files() {
     done
 }
 
-# ----------------- Create GOST Tunnel (FIXED TCP RELAY) -----------------
-create_gost_tunnel() {
+# ----------------- 1. Create GOST Port Forward (L4 TCP/TLS) -----------------
+create_gost_pf() {
     clear
-    echo -e "${CYAN}=== Create GOST Tunnel (TCP Layer 3 TUN) ===${NC}\n"
+    echo -e "${CYAN}=== Create GOST Port Forward (Secure Relay+TLS) ===${NC}"
+    echo -e "${YELLOW}This tunnels Rathole/TCP traffic securely over TLS without L3 IP routing.${NC}\n"
     
     echo -e "${YELLOW}Select Server Role:${NC}"
     echo "1) Foreign Server (Server / Listener)"
@@ -96,62 +96,49 @@ create_gost_tunnel() {
     read -p "Select option [1-2, default: 1]: " SERVER_ROLE
     SERVER_ROLE=${SERVER_ROLE:-1}
 
-    if [ "$SERVER_ROLE" == "1" ]; then
-        ROLE_NAME="SERVER"
-        DEF_NAME="tun1"
-        DEF_PORT="8443"
-        DEF_LOCAL_IP="10.10.10.1/30"
-        DEF_REMOTE_IP="10.10.10.2"
-    else
-        ROLE_NAME="CLIENT"
-        DEF_NAME="tun1"
-        DEF_PORT="8443"
-        DEF_LOCAL_IP="10.10.10.2/30"
-        DEF_REMOTE_IP="10.10.10.1"
-    fi
+    ROLE_NAME="SERVER"
+    [ "$SERVER_ROLE" == "2" ] && ROLE_NAME="CLIENT"
 
-    read -p "Tunnel Name [default: ${DEF_NAME}]: " TUN_NAME
-    TUN_NAME=${TUN_NAME:-$DEF_NAME}
+    read -p "Tunnel/Service Name [default: gost_pf1]: " TUN_NAME
+    TUN_NAME=${TUN_NAME:-gost_pf1}
 
     if [ -f "${CONFIG_DIR}/${TUN_NAME}.conf" ]; then
         echo -e "${RED}[!] Error: Tunnel '${TUN_NAME}' already exists!${NC}"
         read -p "Press Enter to return..."; return
     fi
 
-    if [ "$ROLE_NAME" == "CLIENT" ]; then
+    echo -e "\n${YELLOW}--- Security Credentials ---${NC}"
+    read -p "Username for TLS auth [default: admin]: " AUTH_USER
+    AUTH_USER=${AUTH_USER:-admin}
+    read -p "Password for TLS auth [default: Pass123!]: " AUTH_PASS
+    AUTH_PASS=${AUTH_PASS:-Pass123!}
+
+    echo -e "\n${YELLOW}--- Port Configuration ---${NC}"
+    read -p "Secure GOST Tunnel Port (between servers) [default: 8443]: " TUN_PORT
+    TUN_PORT=${TUN_PORT:-8443}
+
+    if [ "$ROLE_NAME" == "SERVER" ]; then
+        # Server listens securely
+        EXEC_CMD="/usr/local/bin/gost -L relay+tls://${AUTH_USER}:${AUTH_PASS}@:${TUN_PORT}"
+        iptables -I INPUT -p tcp --dport ${TUN_PORT} -j ACCEPT 2>/dev/null
+    else
+        # Client asks for target port to forward
         while true; do
-            read -p "Enter Remote Server Public IP (Foreign IP): " REMOTE_PUB_IP
+            read -p "Remote Server Public IP (Foreign IP): " REMOTE_PUB_IP
             if [ -n "$REMOTE_PUB_IP" ]; then break; fi
             echo -e "${RED}[!] Server IP is required!${NC}"
         done
+        read -p "Local/Remote Application Port (e.g. Rathole port) [default: 2333]: " APP_PORT
+        APP_PORT=${APP_PORT:-2333}
+        
+        # Client listens locally on APP_PORT and securely sends to Server, which outputs to localhost:APP_PORT
+        EXEC_CMD="/usr/local/bin/gost -L tcp://:${APP_PORT}/127.0.0.1:${APP_PORT} -F relay+tls://${AUTH_USER}:${AUTH_PASS}@${REMOTE_PUB_IP}:${TUN_PORT}"
+        iptables -I INPUT -p tcp --dport ${APP_PORT} -j ACCEPT 2>/dev/null
     fi
-
-    read -p "TCP Listen Port [default: ${DEF_PORT}]: " PORT
-    PORT=${PORT:-$DEF_PORT}
-
-    read -p "Local Tunnel IP with CIDR [default: ${DEF_LOCAL_IP}]: " LOCAL_TUN_IP
-    LOCAL_TUN_IP=${LOCAL_TUN_IP:-$DEF_LOCAL_IP}
-
-    read -p "Remote Tunnel IP [default: ${DEF_REMOTE_IP}]: " REMOTE_TUN_IP
-    REMOTE_TUN_IP=${REMOTE_TUN_IP:-$DEF_REMOTE_IP}
-
-    # حل مشکل پینگ: استفاده از لایه relay+tcp برای تبدیل دیتای TUN به TCP سالم
-    if [ "$ROLE_NAME" == "SERVER" ]; then
-        # سرور خارج یک پراکسی TCP می‌سازد و پشت آن اینترفیس TUN را فعال می‌کند (پورت داخلی 8421)
-        EXEC_CMD="/usr/local/bin/gost -L relay+tcp://:${PORT} -L tun://:8421?net=${LOCAL_TUN_IP}"
-        iptables -I INPUT -p tcp --dport ${PORT} -j ACCEPT 2>/dev/null
-    else
-        # سرور ایران دیتا را وارد TUN می‌کند و از طریق پراکسی TCP به سرور خارج می‌فرستد
-        EXEC_CMD="/usr/local/bin/gost -L tun://:8421?net=${LOCAL_TUN_IP} -F relay+tcp://${REMOTE_PUB_IP}:${PORT}"
-    fi
-
-    iptables -I INPUT -i tun+ -j ACCEPT 2>/dev/null
-    iptables -I FORWARD -i tun+ -j ACCEPT 2>/dev/null
-    iptables -I FORWARD -o tun+ -j ACCEPT 2>/dev/null
 
     cat << EOF > /etc/systemd/system/tunnel-${TUN_NAME}.service
 [Unit]
-Description=GOST Tunnel L3 - ${TUN_NAME}
+Description=GOST Secure Port Forward - ${TUN_NAME}
 After=network.target
 
 [Service]
@@ -167,26 +154,32 @@ WantedBy=multi-user.target
 EOF
 
     cat << EOF > "${CONFIG_DIR}/${TUN_NAME}.conf"
-TYPE="GOST"
+TYPE="GOST_PF"
 ROLE="${ROLE_NAME}"
 TUN_NAME="${TUN_NAME}"
-PORT="${PORT}"
-LOCAL_TUN_IP="${LOCAL_TUN_IP}"
-REMOTE_TUN_IP="${REMOTE_TUN_IP}"
+TUN_PORT="${TUN_PORT}"
+APP_PORT="${APP_PORT:-N/A}"
 REMOTE_PUB_IP="${REMOTE_PUB_IP:-N/A}"
 EOF
 
     systemctl daemon-reload
     systemctl enable --now tunnel-${TUN_NAME}.service >/dev/null 2>&1
-    sleep 3
+    sleep 2
 
-    show_summary "${TUN_NAME}"
+    echo -e "\n${GREEN}=== GOST Port Forward Created ===${NC}"
+    echo -e "Name: ${CYAN}${TUN_NAME}${NC} | Role: ${CYAN}${ROLE_NAME}${NC}"
+    if [ "$ROLE_NAME" == "CLIENT" ]; then
+        echo -e "${YELLOW}[*] Usage for Rathole:${NC}"
+        echo -e "Point your Iran Rathole Client to: ${GREEN}127.0.0.1:${APP_PORT}${NC}"
+        echo -e "It will securely exit on Foreign Server at: ${GREEN}127.0.0.1:${APP_PORT}${NC}"
+    fi
+    read -p "Press Enter to return..."
 }
 
-# ----------------- Create GRE Tunnel (DO NOT TOUCH) -----------------
+# ----------------- 2. Create GRE Tunnel (UNTOUCHED - L3 RAW) -----------------
 create_gre_tunnel() {
     clear
-    echo -e "${CYAN}=== Create GRE Tunnel ===${NC}\n"
+    echo -e "${CYAN}=== Create GRE Tunnel (Raw L3) ===${NC}\n"
     
     DETECTED_IP=$(get_public_ip)
 
@@ -275,42 +268,114 @@ EOF
     iptables -I FORWARD -o ${TUN_NAME} -j ACCEPT 2>/dev/null
     sleep 2
 
-    show_summary "${TUN_NAME}"
+    echo -e "\n${GREEN}=== GRE Tunnel Created ===${NC}"
+    read -p "Press Enter to return..."
 }
 
-# ----------------- Summary Screen -----------------
-show_summary() {
-    local NAME=$1
-    source "${CONFIG_DIR}/${NAME}.conf"
+# ----------------- 3. Create WireGuard Tunnel (Encrypted L3 UDP) -----------------
+create_wg_tunnel() {
+    clear
+    echo -e "${CYAN}=== Create WireGuard Tunnel (Encrypted L3 UDP) ===${NC}\n"
     
-    IS_ACTIVE=$(systemctl is-active tunnel-${TUN_NAME}.service 2>/dev/null)
-    
-    echo -e "\n${GREEN}====================================================${NC}"
-    echo -e "${GREEN}             TUNNEL CREATED SUCCESSFULLY            ${NC}"
-    echo -e "${GREEN}====================================================${NC}"
-    echo -e "Tunnel Identifier : ${CYAN}${TUN_NAME}${NC}"
-    echo -e "Protocol Type     : ${CYAN}${TYPE}${NC}"
-    echo -e "Assigned Role     : ${CYAN}${ROLE}${NC}"
-    echo -e "Local Tunnel IP   : ${YELLOW}${LOCAL_TUN_IP}${NC}"
-    echo -e "Remote Tunnel IP  : ${YELLOW}${REMOTE_TUN_IP}${NC}"
-    [ "$TYPE" == "GOST" ] && echo -e "TCP Listen Port   : ${YELLOW}${PORT}${NC}"
-    [ "$TYPE" == "GOST" ] && [ "$ROLE" == "CLIENT" ] && echo -e "Target Public IP  : ${YELLOW}${REMOTE_PUB_IP}${NC}"
-    [ "$TYPE" == "GRE" ] && echo -e "MTU Size          : ${YELLOW}${MTU}${NC}"
-    echo -e "Systemd Service   : ${CYAN}tunnel-${TUN_NAME}.service${NC}"
-    
-    if [ "$IS_ACTIVE" == "active" ]; then
-        echo -e "Current Status    : ${GREEN}Active & Running (UP)${NC}"
+    echo -e "${YELLOW}Important: Run this on Server 1 first, copy its Public Key, then run on Server 2!${NC}\n"
+
+    echo -e "${YELLOW}Select Server Role:${NC}"
+    echo "1) Foreign Server (Server)"
+    echo "2) Iran Server (Client)"
+    read -p "Select option [1-2, default: 1]: " SERVER_ROLE
+    SERVER_ROLE=${SERVER_ROLE:-1}
+
+    if [ "$SERVER_ROLE" == "1" ]; then
+        ROLE_NAME="FOREIGN"
+        DEF_NAME="wg0"
+        DEF_PORT="51820"
+        DEF_LOCAL_IP="10.30.30.1/24"
+        DEF_REMOTE_IP="10.30.30.2"
     else
-        echo -e "Current Status    : ${RED}Service Failed - Check Logs (journalctl -u tunnel-${TUN_NAME}.service)${NC}"
+        ROLE_NAME="IRAN"
+        DEF_NAME="wg0"
+        DEF_PORT="51820"
+        DEF_LOCAL_IP="10.30.30.2/24"
+        DEF_REMOTE_IP="10.30.30.1"
     fi
-    echo -e "${GREEN}====================================================${NC}"
-    echo -e "${YELLOW}[*] How to use inside Rathole or core config:${NC}"
-    echo -e "Set peer target connection IP to: ${CYAN}${REMOTE_TUN_IP}${NC}"
-    echo -e "${GREEN}====================================================${NC}\n"
-    read -p "Press Enter to return to main menu..."
+
+    read -p "Tunnel Name [default: ${DEF_NAME}]: " TUN_NAME
+    TUN_NAME=${TUN_NAME:-$DEF_NAME}
+
+    if [ -f "/etc/wireguard/${TUN_NAME}.conf" ]; then
+        echo -e "${RED}[!] Error: Interface ${TUN_NAME} already exists in /etc/wireguard/!${NC}"
+        read -p "Press Enter to return..."; return
+    fi
+
+    read -p "WireGuard UDP Port [default: ${DEF_PORT}]: " WG_PORT
+    WG_PORT=${WG_PORT:-$DEF_PORT}
+
+    read -p "Local Tunnel IP with CIDR [default: ${DEF_LOCAL_IP}]: " LOCAL_TUN_IP
+    LOCAL_TUN_IP=${LOCAL_TUN_IP:-$DEF_LOCAL_IP}
+
+    read -p "Remote Tunnel IP [default: ${DEF_REMOTE_IP}]: " REMOTE_TUN_IP
+    REMOTE_TUN_IP=${REMOTE_TUN_IP:-$DEF_REMOTE_IP}
+
+    read -p "MTU [default: 1360]: " MTU
+    MTU=${MTU:-1360}
+
+    # Generate Keys
+    PRIV_KEY=$(wg genkey)
+    PUB_KEY=$(echo "$PRIV_KEY" | wg pubkey)
+    
+    echo -e "\n${CYAN}================ YOUR WG PUBLIC KEY =================${NC}"
+    echo -e "${GREEN}${PUB_KEY}${NC}"
+    echo -e "${CYAN}=====================================================${NC}"
+    echo -e "${YELLOW}(Copy this key to paste in the OTHER server's setup)${NC}\n"
+
+    read -p "Enter PEER'S Public Key (Paste it here): " PEER_PUB_KEY
+
+    ENDPOINT_CONF=""
+    if [ "$ROLE_NAME" == "IRAN" ]; then
+        while true; do
+            read -p "Enter Remote Server Public IP (Foreign IP): " REMOTE_PUB_IP
+            if [ -n "$REMOTE_PUB_IP" ]; then break; fi
+            echo -e "${RED}[!] Server IP is required for the client!${NC}"
+        done
+        ENDPOINT_CONF="Endpoint = ${REMOTE_PUB_IP}:${WG_PORT}"
+        PERSISTENT_KEEPALIVE="PersistentKeepalive = 25"
+    fi
+
+    cat << EOF > /etc/wireguard/${TUN_NAME}.conf
+[Interface]
+PrivateKey = ${PRIV_KEY}
+Address = ${LOCAL_TUN_IP}
+ListenPort = ${WG_PORT}
+MTU = ${MTU}
+
+[Peer]
+PublicKey = ${PEER_PUB_KEY}
+AllowedIPs = 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16
+${ENDPOINT_CONF}
+${PERSISTENT_KEEPALIVE}
+EOF
+
+    cat << EOF > "${CONFIG_DIR}/${TUN_NAME}.conf"
+TYPE="WIREGUARD"
+ROLE="${ROLE_NAME}"
+TUN_NAME="${TUN_NAME}"
+LOCAL_TUN_IP="${LOCAL_TUN_IP}"
+REMOTE_TUN_IP="${REMOTE_TUN_IP}"
+MTU="${MTU}"
+EOF
+
+    iptables -I INPUT -p udp --dport ${WG_PORT} -j ACCEPT 2>/dev/null
+    iptables -I INPUT -i ${TUN_NAME} -j ACCEPT 2>/dev/null
+    iptables -I FORWARD -i ${TUN_NAME} -j ACCEPT 2>/dev/null
+
+    systemctl enable --now wg-quick@${TUN_NAME} >/dev/null 2>&1
+    sleep 2
+
+    echo -e "\n${GREEN}=== WireGuard Tunnel Created ===${NC}"
+    read -p "Press Enter to return..."
 }
 
-# ----------------- List All Tunnels -----------------
+# ----------------- Status, Delete, Ping, BBR -----------------
 list_tunnels() {
     clear
     echo -e "${CYAN}=== Configured Tunnels Overview ===${NC}\n"
@@ -318,24 +383,32 @@ list_tunnels() {
     if [ ${#CONFIG_FILES[@]} -eq 0 ]; then
         echo -e "${YELLOW}No tunnels configured yet.${NC}"
     else
-        printf "%-12s %-8s %-10s %-18s %-14s\n" "NAME" "TYPE" "ROLE" "LOCAL IP" "STATUS"
-        echo "------------------------------------------------------------------"
+        printf "%-12s %-12s %-10s %-18s %-14s\n" "NAME" "TYPE" "ROLE" "LOCAL IP" "STATUS"
+        echo "----------------------------------------------------------------------"
         for conf in "${CONFIG_FILES[@]}"; do
             source "$conf"
-            STATUS=$(systemctl is-active tunnel-${TUN_NAME}.service 2>/dev/null)
+            if [ "$TYPE" == "WIREGUARD" ]; then
+                STATUS=$(systemctl is-active wg-quick@${TUN_NAME} 2>/dev/null)
+            else
+                STATUS=$(systemctl is-active tunnel-${TUN_NAME}.service 2>/dev/null)
+            fi
+            
             if [ "$STATUS" == "active" ]; then
                 STATUS_COLOR="${GREEN}active (up)${NC}"
             else
                 STATUS_COLOR="${RED}inactive${NC}"
             fi
-            printf "%-12s %-8s %-10s %-18s %b\n" "$TUN_NAME" "$TYPE" "$ROLE" "$LOCAL_TUN_IP" "$STATUS_COLOR"
+            
+            PRINT_IP="${LOCAL_TUN_IP}"
+            [ "$TYPE" == "GOST_PF" ] && PRINT_IP="L4 Proxy Only"
+            
+            printf "%-12s %-12s %-10s %-18s %b\n" "$TUN_NAME" "$TYPE" "$ROLE" "$PRINT_IP" "$STATUS_COLOR"
         done
     fi
     echo ""
     read -p "Press Enter to return..."
 }
 
-# ----------------- Ping Connectivity Test -----------------
 test_ping() {
     clear
     echo -e "${CYAN}=== Tunnel Connectivity Test (Ping) ===${NC}\n"
@@ -345,15 +418,21 @@ test_ping() {
         read -p "Press Enter to return..."; return
     fi
 
-    echo -e "${YELLOW}Select a tunnel to ping:${NC}"
+    echo -e "${YELLOW}Select a tunnel to ping (L3 IP-based only):${NC}"
+    VALID_INDEXES=()
     for i in "${!CONFIG_FILES[@]}"; do
         source "${CONFIG_FILES[$i]}"
-        echo -e " ${GREEN}$((i+1)))${NC} ${CYAN}${TUN_NAME}${NC} [${TYPE}] -> Ping Target: ${YELLOW}${REMOTE_TUN_IP}${NC}"
+        if [ "$TYPE" == "GOST_PF" ]; then
+            echo -e " ${RED}X)${NC} ${TUN_NAME} [GOST_PF] -> (Skipped: Port Forwarding has no IP to ping)"
+        else
+            echo -e " ${GREEN}$((i+1)))${NC} ${CYAN}${TUN_NAME}${NC} [${TYPE}] -> Ping Target: ${YELLOW}${REMOTE_TUN_IP}${NC}"
+            VALID_INDEXES+=($((i+1)))
+        fi
     done
     echo -e " ${YELLOW}0)${NC} Back to Main Menu\n"
 
-    read -p "Select number [1-${#CONFIG_FILES[@]}, 0 to exit]: " SEL
-    if [[ "$SEL" =~ ^[0-9]+$ ]] && [ "$SEL" -ge 1 ] && [ "$SEL" -le "${#CONFIG_FILES[@]}" ]; then
+    read -p "Select number [0 to exit]: " SEL
+    if [[ " ${VALID_INDEXES[*]} " =~ " ${SEL} " ]]; then
         source "${CONFIG_FILES[$((SEL-1))]}"
         echo -e "\n${YELLOW}[*] Sending 4 packets to ${REMOTE_TUN_IP} via ${TUN_NAME}...${NC}\n"
         ping -c 4 -W 2 "${REMOTE_TUN_IP}"
@@ -362,7 +441,6 @@ test_ping() {
     read -p "Press Enter to return..."
 }
 
-# ----------------- Delete Tunnel -----------------
 delete_tunnel() {
     clear
     echo -e "${RED}=== Delete Tunnel ===${NC}\n"
@@ -375,7 +453,7 @@ delete_tunnel() {
     echo -e "${YELLOW}Select a tunnel to DELETE:${NC}"
     for i in "${!CONFIG_FILES[@]}"; do
         source "${CONFIG_FILES[$i]}"
-        echo -e " ${GREEN}$((i+1)))${NC} ${CYAN}${TUN_NAME}${NC} [${TYPE}] Role: ${ROLE} | IP: ${LOCAL_TUN_IP}"
+        echo -e " ${GREEN}$((i+1)))${NC} ${CYAN}${TUN_NAME}${NC} [${TYPE}] Role: ${ROLE}"
     done
     echo -e " ${YELLOW}0)${NC} Cancel & Back\n"
 
@@ -385,16 +463,23 @@ delete_tunnel() {
         source "$CONF_FILE"
         read -p "Are you sure you want to delete '${TUN_NAME}'? [y/N]: " CONFIRM
         if [[ "$CONFIRM" =~ ^[yY]$ ]]; then
-            systemctl stop tunnel-${TUN_NAME}.service >/dev/null 2>&1
-            systemctl disable tunnel-${TUN_NAME}.service >/dev/null 2>&1
-            rm -f /etc/systemd/system/tunnel-${TUN_NAME}.service
-            systemctl daemon-reload
-
-            if [ "$TYPE" == "GRE" ]; then
-                ip link set dev "${TUN_NAME}" down 2>/dev/null
-                ip tunnel del "${TUN_NAME}" 2>/dev/null
-            elif [ "$TYPE" == "GOST" ]; then
-                killall -9 gost 2>/dev/null
+            
+            if [ "$TYPE" == "WIREGUARD" ]; then
+                systemctl stop wg-quick@${TUN_NAME} >/dev/null 2>&1
+                systemctl disable wg-quick@${TUN_NAME} >/dev/null 2>&1
+                rm -f /etc/wireguard/${TUN_NAME}.conf
+            else
+                systemctl stop tunnel-${TUN_NAME}.service >/dev/null 2>&1
+                systemctl disable tunnel-${TUN_NAME}.service >/dev/null 2>&1
+                rm -f /etc/systemd/system/tunnel-${TUN_NAME}.service
+                systemctl daemon-reload
+                
+                if [ "$TYPE" == "GRE" ]; then
+                    ip link set dev "${TUN_NAME}" down 2>/dev/null
+                    ip tunnel del "${TUN_NAME}" 2>/dev/null
+                elif [ "$TYPE" == "GOST_PF" ]; then
+                    killall -9 gost 2>/dev/null
+                fi
             fi
 
             rm -f "$CONF_FILE"
@@ -406,7 +491,6 @@ delete_tunnel() {
     read -p "Press Enter to return..."
 }
 
-# ----------------- TCP BBR Optimization -----------------
 optimize_system() {
     clear
     echo -e "${CYAN}=== Enable TCP BBR Congestion Control ===${NC}"
@@ -420,31 +504,33 @@ optimize_system() {
     read -p "Press Enter to return..."
 }
 
-# ----------------- Main Menu Loop -----------------
+# ----------------- Main Menu -----------------
 install_prerequisites
 
 while true; do
     clear
     echo -e "${CYAN}====================================================${NC}"
-    echo -e "${CYAN}         Multi-Tunnel Manager (GOST & GRE)          ${NC}"
+    echo -e "${CYAN}       Tunnel Manager (GOST PF, GRE, WireGuard)     ${NC}"
     echo -e "${CYAN}====================================================${NC}"
-    echo -e "${YELLOW}1)${NC} Create GOST Tunnel (TCP Layer 3 - Recommended)"
+    echo -e "${YELLOW}1)${NC} Create GOST Tunnel (Secure TLS Port Forward L4)"
     echo -e "${YELLOW}2)${NC} Create GRE Tunnel (Raw L3)"
-    echo -e "${YELLOW}3)${NC} List All Tunnels & Status"
-    echo -e "${YELLOW}4)${NC} Ping Connectivity Test"
-    echo -e "${YELLOW}5)${NC} Delete a Tunnel"
-    echo -e "${YELLOW}6)${NC} Optimize Network (Enable BBR)"
+    echo -e "${YELLOW}3)${NC} Create WireGuard Tunnel (Encrypted UDP L3)"
+    echo -e "${YELLOW}4)${NC} List All Tunnels & Status"
+    echo -e "${YELLOW}5)${NC} Ping Connectivity Test"
+    echo -e "${YELLOW}6)${NC} Delete a Tunnel"
+    echo -e "${YELLOW}7)${NC} Optimize Network (Enable BBR)"
     echo -e "${YELLOW}0)${NC} Exit"
     echo -e "${CYAN}====================================================${NC}"
-    read -p "Choose an option [0-6]: " OPTION
+    read -p "Choose an option [0-7]: " OPTION
 
     case $OPTION in
-        1) create_gost_tunnel ;;
+        1) create_gost_pf ;;
         2) create_gre_tunnel ;;
-        3) list_tunnels ;;
-        4) test_ping ;;
-        5) delete_tunnel ;;
-        6) optimize_system ;;
+        3) create_wg_tunnel ;;
+        4) list_tunnels ;;
+        5) test_ping ;;
+        6) delete_tunnel ;;
+        7) optimize_system ;;
         0) clear; exit 0 ;;
         *) echo -e "${RED}[!] Invalid option!${NC}"; sleep 1 ;;
     esac
