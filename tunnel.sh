@@ -1,6 +1,6 @@
 #!/bin/bash
 # ====================================================
-# Multi-Tunnel Manager (GOST & GRE) - Fully Fixed
+# Multi-Tunnel Manager (GRE & BackPack)
 # GitHub: https://github.com/Mnidri/tunnel.sh
 # ====================================================
 
@@ -16,7 +16,6 @@ mkdir -p "${CONFIG_DIR}"
 
 # ----------------- Helper: Detect Public IP -----------------
 get_public_ip() {
-    # دریافت آی‌پی و فیلتر کردن هرگونه کد HTML (فقط اعداد و نقطه مجاز است)
     local IP=$(curl -s4 --max-time 3 api.ipify.org | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$')
     if [ -z "$IP" ]; then
         IP=$(curl -s4 --max-time 3 icanhazip.com | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$')
@@ -36,25 +35,6 @@ install_prerequisites() {
     sed -i '/net.ipv4.ip_forward/d' /etc/sysctl.conf
     echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
 
-    # Install GOST binary securely
-    if [ ! -f /usr/local/bin/gost ]; then
-        echo -e "${YELLOW}[*] Installing GOST binary...${NC}"
-        ARCH=$(uname -m)
-        case "$ARCH" in
-            x86_64) GOST_ARCH="amd64" ;;
-            aarch64) GOST_ARCH="arm64" ;;
-            *) echo -e "${RED}[!] Unsupported architecture: $ARCH${NC}"; exit 1 ;;
-        esac
-        
-        # دانلود و استخراج دقیق فایل بر اساس نام‌گذاری‌های گیت‌هاب
-        wget -qO /tmp/gost.tar.gz "https://github.com/ginuerzh/gost/releases/download/v2.11.5/gost-linux-${GOST_ARCH}-2.11.5.tar.gz"
-        tar -xzf /tmp/gost.tar.gz -C /tmp/
-        
-        # انتقال فایل استخراج شده (حتی اگر نام آن طولانی باشد) به نام استاندارد gost
-        find /tmp -type f -name "gost-linux-*" -exec mv {} /usr/local/bin/gost \;
-        chmod +x /usr/local/bin/gost
-        rm -rf /tmp/gost*
-    fi
     echo -e "${GREEN}[+] Dependencies are ready.${NC}\n"
     sleep 1
 }
@@ -67,101 +47,14 @@ get_config_files() {
     done
 }
 
-# ----------------- Create GOST Tunnel -----------------
-create_gost_tunnel() {
+# ----------------- Run BackPack Script -----------------
+run_backpack() {
     clear
-    echo -e "${CYAN}=== Create GOST Tunnel (TCP Layer 3 TUN) ===${NC}\n"
-    
-    echo -e "${YELLOW}Select Server Role:${NC}"
-    echo "1) Foreign Server (Server / Listener)"
-    echo "2) Iran Server (Client / Forwarder)"
-    read -p "Select option [1-2, default: 1]: " SERVER_ROLE
-    SERVER_ROLE=${SERVER_ROLE:-1}
-
-    if [ "$SERVER_ROLE" == "1" ]; then
-        ROLE_NAME="SERVER"
-        DEF_NAME="tun1"
-        DEF_PORT="8443"
-        DEF_LOCAL_IP="10.10.10.1/30"
-        DEF_REMOTE_IP="10.10.10.2"
-    else
-        ROLE_NAME="CLIENT"
-        DEF_NAME="tun1"
-        DEF_PORT="8443"
-        DEF_LOCAL_IP="10.10.10.2/30"
-        DEF_REMOTE_IP="10.10.10.1"
-    fi
-
-    read -p "Tunnel Name [default: ${DEF_NAME}]: " TUN_NAME
-    TUN_NAME=${TUN_NAME:-$DEF_NAME}
-
-    if [ -f "${CONFIG_DIR}/${TUN_NAME}.conf" ]; then
-        echo -e "${RED}[!] Error: Tunnel '${TUN_NAME}' already exists!${NC}"
-        read -p "Press Enter to return..."; return
-    fi
-
-    if [ "$ROLE_NAME" == "CLIENT" ]; then
-        while true; do
-            read -p "Enter Remote Server Public IP (Foreign IP): " REMOTE_PUB_IP
-            if [ -n "$REMOTE_PUB_IP" ]; then break; fi
-            echo -e "${RED}[!] Server IP is required!${NC}"
-        done
-    fi
-
-    read -p "TCP Listen Port [default: ${DEF_PORT}]: " PORT
-    PORT=${PORT:-$DEF_PORT}
-
-    read -p "Local Tunnel IP with CIDR [default: ${DEF_LOCAL_IP}]: " LOCAL_TUN_IP
-    LOCAL_TUN_IP=${LOCAL_TUN_IP:-$DEF_LOCAL_IP}
-
-    read -p "Remote Tunnel IP [default: ${DEF_REMOTE_IP}]: " REMOTE_TUN_IP
-    REMOTE_TUN_IP=${REMOTE_TUN_IP:-$DEF_REMOTE_IP}
-
-    # دستورات بدون کوتیشن برای جلوگیری از تداخل systemd
-    if [ "$ROLE_NAME" == "SERVER" ]; then
-        EXEC_CMD="/usr/local/bin/gost -L tun://:${PORT}?net=${LOCAL_TUN_IP}"
-        iptables -I INPUT -p tcp --dport ${PORT} -j ACCEPT 2>/dev/null
-    else
-        # کلاینت به صورت مجازی روی یک پورت رندوم لوکال گوش می‌دهد تا ساختار TUN برقرار شود
-        EXEC_CMD="/usr/local/bin/gost -L tun://:10443?net=${LOCAL_TUN_IP} -F tcp://${REMOTE_PUB_IP}:${PORT}"
-    fi
-
-    iptables -I INPUT -i tun+ -j ACCEPT 2>/dev/null
-    iptables -I FORWARD -i tun+ -j ACCEPT 2>/dev/null
-    iptables -I FORWARD -o tun+ -j ACCEPT 2>/dev/null
-
-    cat << EOF > /etc/systemd/system/tunnel-${TUN_NAME}.service
-[Unit]
-Description=GOST Tunnel L3 - ${TUN_NAME}
-After=network.target
-
-[Service]
-Type=simple
-User=root
-ExecStart=${EXEC_CMD}
-Restart=always
-RestartSec=3
-LimitNOFILE=65535
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-    cat << EOF > "${CONFIG_DIR}/${TUN_NAME}.conf"
-TYPE="GOST"
-ROLE="${ROLE_NAME}"
-TUN_NAME="${TUN_NAME}"
-PORT="${PORT}"
-LOCAL_TUN_IP="${LOCAL_TUN_IP}"
-REMOTE_TUN_IP="${REMOTE_TUN_IP}"
-REMOTE_PUB_IP="${REMOTE_PUB_IP:-N/A}"
-EOF
-
-    systemctl daemon-reload
-    systemctl enable --now tunnel-${TUN_NAME}.service >/dev/null 2>&1
-    sleep 3
-
-    show_summary "${TUN_NAME}"
+    echo -e "${CYAN}=== Launching BackPack Tunnel Installer ===${NC}\n"
+    echo -e "${YELLOW}[*] Fetching and running BackPack from GitHub...${NC}\n"
+    bash <(curl -fsSL https://raw.githubusercontent.com/AminMGMT/BackPack/main/install.sh)
+    echo -e "\n${GREEN}[+] BackPack process exited.${NC}"
+    read -p "Press Enter to return to main menu..."
 }
 
 # ----------------- Create GRE Tunnel -----------------
@@ -197,7 +90,6 @@ create_gre_tunnel() {
         read -p "Press Enter to return..."; return
     fi
 
-    # استفاده از آی‌پی فیلتر شده و تمیز
     read -p "Local Public IP [default: ${DETECTED_IP}]: " LOCAL_PUB_IP
     LOCAL_PUB_IP=${LOCAL_PUB_IP:-$DETECTED_IP}
 
@@ -275,9 +167,7 @@ show_summary() {
     echo -e "Assigned Role     : ${CYAN}${ROLE}${NC}"
     echo -e "Local Tunnel IP   : ${YELLOW}${LOCAL_TUN_IP}${NC}"
     echo -e "Remote Tunnel IP  : ${YELLOW}${REMOTE_TUN_IP}${NC}"
-    [ "$TYPE" == "GOST" ] && echo -e "TCP Listen Port   : ${YELLOW}${PORT}${NC}"
-    [ "$TYPE" == "GOST" ] && [ "$ROLE" == "CLIENT" ] && echo -e "Target Public IP  : ${YELLOW}${REMOTE_PUB_IP}${NC}"
-    [ "$TYPE" == "GRE" ] && echo -e "MTU Size          : ${YELLOW}${MTU}${NC}"
+    echo -e "MTU Size          : ${YELLOW}${MTU}${NC}"
     echo -e "Systemd Service   : ${CYAN}tunnel-${TUN_NAME}.service${NC}"
     
     if [ "$IS_ACTIVE" == "active" ]; then
@@ -286,8 +176,8 @@ show_summary() {
         echo -e "Current Status    : ${RED}Service Failed - Check Logs (journalctl -u tunnel-${TUN_NAME}.service)${NC}"
     fi
     echo -e "${GREEN}====================================================${NC}"
-    echo -e "${YELLOW}[*] How to use inside Rathole or core config:${NC}"
-    echo -e "Set peer target connection IP to: ${CYAN}${REMOTE_TUN_IP}${NC}"
+    echo -e "${YELLOW}[*] Ready for BackPack or core config:${NC}"
+    echo -e "Set peer connection target IP to: ${CYAN}${REMOTE_TUN_IP}${NC}"
     echo -e "${GREEN}====================================================${NC}\n"
     read -p "Press Enter to return to main menu..."
 }
@@ -295,7 +185,7 @@ show_summary() {
 # ----------------- List All Tunnels -----------------
 list_tunnels() {
     clear
-    echo -e "${CYAN}=== Configured Tunnels Overview ===${NC}\n"
+    echo -e "${CYAN}=== Configured GRE Tunnels Overview ===${NC}\n"
     get_config_files
     if [ ${#CONFIG_FILES[@]} -eq 0 ]; then
         echo -e "${YELLOW}No tunnels configured yet.${NC}"
@@ -347,7 +237,7 @@ test_ping() {
 # ----------------- Delete Tunnel -----------------
 delete_tunnel() {
     clear
-    echo -e "${RED}=== Delete Tunnel ===${NC}\n"
+    echo -e "${RED}=== Delete GRE Tunnel ===${NC}\n"
     get_config_files
     if [ ${#CONFIG_FILES[@]} -eq 0 ]; then
         echo -e "${YELLOW}No tunnels found to delete.${NC}"
@@ -372,12 +262,8 @@ delete_tunnel() {
             rm -f /etc/systemd/system/tunnel-${TUN_NAME}.service
             systemctl daemon-reload
 
-            if [ "$TYPE" == "GRE" ]; then
-                ip link set dev "${TUN_NAME}" down 2>/dev/null
-                ip tunnel del "${TUN_NAME}" 2>/dev/null
-            elif [ "$TYPE" == "GOST" ]; then
-                killall -9 gost 2>/dev/null
-            fi
+            ip link set dev "${TUN_NAME}" down 2>/dev/null
+            ip tunnel del "${TUN_NAME}" 2>/dev/null
 
             rm -f "$CONF_FILE"
             echo -e "${GREEN}[+] Tunnel '${TUN_NAME}' completely removed.${NC}"
@@ -408,9 +294,9 @@ install_prerequisites
 while true; do
     clear
     echo -e "${CYAN}====================================================${NC}"
-    echo -e "${CYAN}         Multi-Tunnel Manager (GOST & GRE)          ${NC}"
+    echo -e "${CYAN}       Tunnel Core Manager (GRE & BackPack)         ${NC}"
     echo -e "${CYAN}====================================================${NC}"
-    echo -e "${YELLOW}1)${NC} Create GOST Tunnel (TCP Layer 3 - Recommended)"
+    echo -e "${YELLOW}1)${NC} Launch BackPack Manager (Install/Run)"
     echo -e "${YELLOW}2)${NC} Create GRE Tunnel (Raw L3)"
     echo -e "${YELLOW}3)${NC} List All Tunnels & Status"
     echo -e "${YELLOW}4)${NC} Ping Connectivity Test"
@@ -421,7 +307,7 @@ while true; do
     read -p "Choose an option [0-6]: " OPTION
 
     case $OPTION in
-        1) create_gost_tunnel ;;
+        1) run_backpack ;;
         2) create_gre_tunnel ;;
         3) list_tunnels ;;
         4) test_ping ;;
